@@ -7,6 +7,9 @@ edition = "2024"
 # Audio file decoding (WAV, FLAC, MP3, OGG, etc.)
 symphonia = { version = "0.5", features = ["all"] }
 
+# MIDI file parsing
+midly = "0.5"
+
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
 

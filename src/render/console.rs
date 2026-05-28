@@ -1,4 +1,5 @@
 use crate::domain::audio::GridOnset;
+use crate::domain::midi::MidiSource;
 use crate::domain::time::TimeMap;
 
 /// Configuration for the console onset grid renderer.
@@ -139,6 +140,126 @@ pub fn render_onsets(
             time_map.bpm,
         );
         println!();
+    }
+}
+
+/// Render one or more `MidiSource`s as a beat grid in the terminal.
+///
+/// Each MIDI source gets its own labeled row within each bar's cell.
+/// A `■` marker indicates a note-on event in that subdivision.
+/// If multiple notes fire in the same subdivision they still show as one `■`.
+pub fn render_midi_sources(
+    sources: &[MidiSource],
+    time_map: &TimeMap,
+    config: &ConsoleRendererConfig,
+) {
+    let beats_per_bar = time_map.time_signature.beats_per_bar();
+    let subdivisions_per_bar = (beats_per_bar / config.subdivision).round() as usize;
+
+    // Find the longest source to determine total bars.
+    let max_beats = sources
+        .iter()
+        .map(|s| s.length_beats.0)
+        .fold(0.0_f64, f64::max);
+    let total_bars = (max_beats / beats_per_bar).ceil() as usize;
+
+    println!();
+    println!(
+        "  BPM: {}  |  Time signature: {}  |  {} bars  |  {} source(s)",
+        time_map.bpm,
+        time_map.time_signature,
+        total_bars,
+        sources.len(),
+    );
+
+    // For each source, build a (bar, sub_idx) -> bool lookup.
+    let source_grids: Vec<std::collections::HashSet<(usize, usize)>> = sources
+        .iter()
+        .map(|source| {
+            let mut grid = std::collections::HashSet::new();
+            for event in &source.events {
+                let global_beat = event.beat.0;
+                let bar = (global_beat / beats_per_bar).floor() as usize;
+                let beat_in_bar = global_beat % beats_per_bar;
+                let sub_idx = (beat_in_bar / config.subdivision).round() as usize;
+                let sub_idx = sub_idx.min(subdivisions_per_bar - 1);
+                grid.insert((bar, sub_idx));
+            }
+            grid
+        })
+        .collect();
+
+    let rows = (total_bars + config.bars_per_row - 1) / config.bars_per_row;
+
+    for row in 0..rows {
+        let bar_start = row * config.bars_per_row;
+        let bar_end = (bar_start + config.bars_per_row).min(total_bars);
+        let bar_width = subdivisions_per_bar * 2 + 1;
+
+        // Header: bar numbers.
+        print!("  {:12}", "");
+        for bar in bar_start..bar_end {
+            let bar_label = format!(" Bar {:>3} ", bar + 1);
+            print!("|{}", format!("{:^width$}", bar_label, width = bar_width));
+        }
+        println!("|");
+
+        // Sub-header: beat markers.
+        print!("  {:12}", "");
+        for _ in bar_start..bar_end {
+            print!("|");
+            for sub in 0..subdivisions_per_bar {
+                let beat_pos = sub as f64 * config.subdivision;
+                if beat_pos.fract() == 0.0 {
+                    print!("{:<2}", beat_pos as usize + 1);
+                } else {
+                    print!(". ");
+                }
+            }
+        }
+        println!("|");
+
+        // One event row per MIDI source.
+        for (src_idx, source) in sources.iter().enumerate() {
+            let label = format!("  {:12}", truncate_label(source.id.as_str(), 12));
+            print!("{}", label);
+            for bar in bar_start..bar_end {
+                print!("|");
+                for sub in 0..subdivisions_per_bar {
+                    if source_grids[src_idx].contains(&(bar, sub)) {
+                        print!("■ ");
+                    } else {
+                        print!("  ");
+                    }
+                }
+            }
+            println!("|  {}", source.id.as_str());
+        }
+        println!();
+    }
+
+    // Per-source summary.
+    for source in sources {
+        println!(
+            "  {}  |  {:.2} beats  |  {} events  |  {} unique notes  |  PPQ: {}{}",
+            source.id.as_str(),
+            source.length_beats.0,
+            source.events.len(),
+            source.unique_notes().len(),
+            source.ppq,
+            source.embedded_bpm
+                .map(|b| format!("  |  embedded BPM: {:.1}", b))
+                .unwrap_or_default(),
+        );
+    }
+    println!();
+}
+
+fn truncate_label(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max_len - 1])
     }
 }
 

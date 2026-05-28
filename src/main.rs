@@ -8,15 +8,15 @@ use clap::Parser;
 
 use domain::time::{Seconds, TimeSignature};
 use pipeline::audio_analysis::analyze_audio;
-use pipeline::onset_detection::{PeakPickerConfig, detect_onsets};
 use pipeline::beat_mapper::{build_time_map, map_onsets_to_grid, refine_beat_zero};
-use render::console::{ConsoleRendererConfig, render_onset_curve_sparkline, render_onsets};
+use pipeline::midi_loader::load_midi_sources;
+use pipeline::onset_detection::{PeakPickerConfig, detect_onsets};
+use render::console::{ConsoleRendererConfig, render_midi_sources, render_onset_curve_sparkline, render_onsets};
 
 /// onset-matcher: MIDI-guided reference-audio alignment and arrangement inference tool.
 #[derive(Parser, Debug)]
 #[command(name = "onset-matcher", version, about, long_about = None)]
 struct Cli {
-    /// Subcommand.
     #[command(subcommand)]
     command: Command,
 }
@@ -25,9 +25,14 @@ struct Cli {
 enum Command {
     /// Detect and display audio onsets as a beat grid in the terminal.
     ShowOnsets(ShowOnsetsArgs),
+    /// Load and display MIDI file(s) as a beat grid in the terminal.
+    ShowMidi(ShowMidiArgs),
 }
 
-/// Arguments for the `show-onsets` subcommand.
+// ---------------------------------------------------------------------------
+// show-onsets
+// ---------------------------------------------------------------------------
+
 #[derive(clap::Args, Debug)]
 struct ShowOnsetsArgs {
     /// Path to the audio file (WAV, FLAC, MP3, OGG, etc.).
@@ -72,16 +77,55 @@ struct ShowOnsetsArgs {
     show_curve: bool,
 }
 
+// ---------------------------------------------------------------------------
+// show-midi
+// ---------------------------------------------------------------------------
+
+#[derive(clap::Args, Debug)]
+struct ShowMidiArgs {
+    /// One or more MIDI files to load and display.
+    #[arg(value_name = "MIDI_FILE", required = true, num_args = 1..)]
+    midi_files: Vec<PathBuf>,
+
+    /// Tempo in BPM. If omitted, the BPM embedded in the MIDI file is used.
+    /// Required if no MIDI file contains a tempo event.
+    #[arg(long, value_name = "BPM")]
+    bpm: Option<f64>,
+
+    /// Time signature numerator (beats per bar). Default: 4.
+    #[arg(long, value_name = "NUMERATOR", default_value = "4")]
+    time_sig_num: u8,
+
+    /// Time signature denominator. Default: 4.
+    #[arg(long, value_name = "DENOMINATOR", default_value = "4")]
+    time_sig_den: u8,
+
+    /// Beat subdivision for the grid display. Default: 0.25 (16th notes).
+    #[arg(long, value_name = "SUBDIVISION", default_value = "0.25")]
+    subdivision: f64,
+
+    /// Number of bars to display per row. Default: 4.
+    #[arg(long, value_name = "N", default_value = "4")]
+    bars_per_row: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
     match cli.command {
         Command::ShowOnsets(args) => run_show_onsets(args),
+        Command::ShowMidi(args) => run_show_midi(args),
     }
 }
 
+// ---------------------------------------------------------------------------
+// show-onsets implementation
+// ---------------------------------------------------------------------------
+
 fn run_show_onsets(args: ShowOnsetsArgs) -> Result<()> {
-    // --- Step 1: Validate inputs ---
     if args.bpm <= 0.0 {
         anyhow::bail!("BPM must be greater than 0");
     }
@@ -91,45 +135,30 @@ fn run_show_onsets(args: ShowOnsetsArgs) -> Result<()> {
 
     println!("Loading audio: {}", args.audio.display());
 
-    // --- Step 2: Analyse audio ---
     let mut analysis = analyze_audio(&args.audio)
         .with_context(|| format!("Failed to analyse audio file: {}", args.audio.display()))?;
 
     let duration = analysis.onset_curve.duration_seconds();
     println!(
         "  Sample rate: {} Hz  |  Duration: {:.2}s  |  {} onset frames",
-        analysis.sample_rate,
-        duration.0,
-        analysis.onset_curve.values.len(),
+        analysis.sample_rate, duration.0, analysis.onset_curve.values.len(),
     );
 
-    // --- Step 3: Detect onsets ---
-    let picker_config = PeakPickerConfig {
-        threshold: args.threshold,
-        ..Default::default()
-    };
+    let picker_config = PeakPickerConfig { threshold: args.threshold, ..Default::default() };
     let onsets = detect_onsets(&analysis.onset_curve, &picker_config);
     analysis.observed_onsets = onsets;
     println!("  Detected {} onset peaks (threshold: {})", analysis.observed_onsets.len(), args.threshold);
 
-    // --- Step 4: Build TimeMap ---
     let time_sig = TimeSignature::new(args.time_sig_num, args.time_sig_den);
     let mut time_map = build_time_map(args.bpm, time_sig, Seconds(0.0));
 
-    // --- Step 5: Optionally refine beat-zero ---
     if args.refine_beat_zero && !analysis.observed_onsets.is_empty() {
         time_map = refine_beat_zero(&analysis.observed_onsets, &time_map, 0.3);
-        println!(
-            "  Beat-zero refined to: {:.4}s",
-            time_map.beat_zero_seconds.0
-        );
+        println!("  Beat-zero refined to: {:.4}s", time_map.beat_zero_seconds.0);
     }
 
-    // --- Step 6: Map onsets to beat grid ---
-    let grid_onsets =
-        map_onsets_to_grid(&analysis.observed_onsets, &time_map, args.subdivision);
+    let grid_onsets = map_onsets_to_grid(&analysis.observed_onsets, &time_map, args.subdivision);
 
-    // --- Step 7: Render ---
     if args.show_curve {
         render_onset_curve_sparkline(&analysis.onset_curve.values, 80);
     }
@@ -141,6 +170,44 @@ fn run_show_onsets(args: ShowOnsetsArgs) -> Result<()> {
     };
 
     render_onsets(&grid_onsets, &time_map, duration.0, &render_config);
+    Ok(())
+}
 
+// ---------------------------------------------------------------------------
+// show-midi implementation
+// ---------------------------------------------------------------------------
+
+fn run_show_midi(args: ShowMidiArgs) -> Result<()> {
+    if let Some(bpm) = args.bpm {
+        if bpm <= 0.0 {
+            anyhow::bail!("BPM must be greater than 0");
+        }
+    }
+    if args.subdivision <= 0.0 || args.subdivision > 4.0 {
+        anyhow::bail!("subdivision must be between 0.0 and 4.0");
+    }
+
+    let paths: Vec<&std::path::Path> = args.midi_files.iter().map(|p| p.as_path()).collect();
+
+    println!("Loading {} MIDI file(s)...", paths.len());
+    for p in &paths {
+        println!("  {}", p.display());
+    }
+
+    let (sources, effective_bpm) = load_midi_sources(&paths, args.bpm)
+        .context("Failed to load MIDI files")?;
+
+    println!("  Effective BPM: {:.1}", effective_bpm);
+
+    let time_sig = TimeSignature::new(args.time_sig_num, args.time_sig_den);
+    let time_map = build_time_map(effective_bpm, time_sig, Seconds(0.0));
+
+    let render_config = ConsoleRendererConfig {
+        subdivision: args.subdivision,
+        bars_per_row: args.bars_per_row,
+        show_strength: false,
+    };
+
+    render_midi_sources(&sources, &time_map, &render_config);
     Ok(())
 }
