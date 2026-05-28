@@ -2,6 +2,9 @@ use crate::domain::audio::GridOnset;
 use crate::domain::midi::MidiSource;
 use crate::domain::time::TimeMap;
 
+/// Label used for the audio onset row in the combined `render_compare` grid.
+pub const AUDIO_ROW_LABEL: &str = "audio";
+
 /// Configuration for the console onset grid renderer.
 pub struct ConsoleRendererConfig {
     /// Beat subdivision to use for columns.
@@ -194,7 +197,7 @@ pub fn render_midi_sources(
     for row in 0..rows {
         let bar_start = row * config.bars_per_row;
         let bar_end = (bar_start + config.bars_per_row).min(total_bars);
-        let bar_width = subdivisions_per_bar * 2 + 1;
+        let bar_width = subdivisions_per_bar * 2;
 
         // Header: bar numbers.
         print!("  {:12}", "");
@@ -239,6 +242,176 @@ pub fn render_midi_sources(
     }
 
     // Per-source summary.
+    for source in sources {
+        println!(
+            "  {}  |  {:.2} beats  |  {} events  |  {} unique notes  |  PPQ: {}{}",
+            source.id.as_str(),
+            source.length_beats.0,
+            source.events.len(),
+            source.unique_notes().len(),
+            source.ppq,
+            source.embedded_bpm
+                .map(|b| format!("  |  embedded BPM: {:.1}", b))
+                .unwrap_or_default(),
+        );
+    }
+    println!();
+}
+
+/// Render audio onsets and one or more MIDI sources together on the same beat grid.
+///
+/// Layout (per row):
+///   - One header row with bar numbers
+///   - One sub-header row with beat/subdivision markers
+///   - One audio onset row labelled "audio" (onset strength markers: `·` `•` `●`)
+///   - One row per MIDI source (note markers: `■`)
+///
+/// The grid span is the longer of the audio duration and the longest MIDI source.
+pub fn render_compare(
+    grid_onsets: &[GridOnset],
+    audio_duration_seconds: f64,
+    sources: &[MidiSource],
+    time_map: &TimeMap,
+    config: &ConsoleRendererConfig,
+) {
+    let beats_per_bar = time_map.time_signature.beats_per_bar();
+    let subdivisions_per_bar = (beats_per_bar / config.subdivision).round() as usize;
+
+    // Total span: max of audio and MIDI.
+    let audio_beats =
+        (audio_duration_seconds - time_map.beat_zero_seconds.0).max(0.0)
+            / time_map.seconds_per_beat();
+    let midi_beats = sources
+        .iter()
+        .map(|s| s.length_beats.0)
+        .fold(0.0_f64, f64::max);
+    let total_beats = audio_beats.max(midi_beats);
+    let total_bars = (total_beats / beats_per_bar).ceil() as usize;
+
+    println!();
+    println!(
+        "  BPM: {}  |  Time signature: {}  |  {} bars  |  {} detected onsets  |  {} source(s)",
+        time_map.bpm,
+        time_map.time_signature,
+        total_bars,
+        grid_onsets.len(),
+        sources.len(),
+    );
+    println!();
+
+    // Build audio onset lookup: (bar, sub_idx) -> strongest strength.
+    let mut audio_grid: std::collections::HashMap<(usize, usize), f32> =
+        std::collections::HashMap::new();
+    for onset in grid_onsets {
+        let bar = onset.bar as usize;
+        let sub_idx = (onset.beat_in_bar / config.subdivision).round() as usize;
+        let sub_idx = sub_idx.min(subdivisions_per_bar - 1);
+        let entry = audio_grid.entry((bar, sub_idx)).or_insert(0.0);
+        if onset.strength > *entry {
+            *entry = onset.strength;
+        }
+    }
+
+    // Build per-source MIDI lookup: (bar, sub_idx) -> present.
+    let source_grids: Vec<std::collections::HashSet<(usize, usize)>> = sources
+        .iter()
+        .map(|source| {
+            let mut grid = std::collections::HashSet::new();
+            for event in &source.events {
+                let global_beat = event.beat.0;
+                let bar = (global_beat / beats_per_bar).floor() as usize;
+                let beat_in_bar = global_beat % beats_per_bar;
+                let sub_idx = (beat_in_bar / config.subdivision).round() as usize;
+                let sub_idx = sub_idx.min(subdivisions_per_bar - 1);
+                grid.insert((bar, sub_idx));
+            }
+            grid
+        })
+        .collect();
+
+    let rows = (total_bars + config.bars_per_row - 1) / config.bars_per_row;
+    let label_width: usize = 12;
+
+    for row in 0..rows {
+        let bar_start = row * config.bars_per_row;
+        let bar_end = (bar_start + config.bars_per_row).min(total_bars);
+        let bar_width = subdivisions_per_bar * 2;
+
+        // Header: bar numbers.
+        print!("  {:width$}", "", width = label_width);
+        for bar in bar_start..bar_end {
+            let bar_label = format!(" Bar {:>3} ", bar + 1);
+            print!("|{}", format!("{:^width$}", bar_label, width = bar_width));
+        }
+        println!("|");
+
+        // Sub-header: beat markers.
+        print!("  {:width$}", "", width = label_width);
+        for _ in bar_start..bar_end {
+            print!("|");
+            for sub in 0..subdivisions_per_bar {
+                let beat_pos = sub as f64 * config.subdivision;
+                if beat_pos.fract() == 0.0 {
+                    print!("{:<2}", beat_pos as usize + 1);
+                } else {
+                    print!(". ");
+                }
+            }
+        }
+        println!("|");
+
+        // Audio onset row.
+        print!("  {}", format!("{:width$}", truncate_label(AUDIO_ROW_LABEL, label_width), width = label_width));
+        for bar in bar_start..bar_end {
+            print!("|");
+            for sub in 0..subdivisions_per_bar {
+                if let Some(&strength) = audio_grid.get(&(bar, sub)) {
+                    let marker = strength_to_marker(strength);
+                    if config.show_strength {
+                        print!("{}{:.0}", marker, strength * 9.0);
+                    } else {
+                        print!("{} ", marker);
+                    }
+                } else {
+                    print!("  ");
+                }
+            }
+        }
+        println!("|  (audio onsets)");
+
+        // One row per MIDI source.
+        for (src_idx, source) in sources.iter().enumerate() {
+            print!("  {}", format!("{:width$}", truncate_label(source.id.as_str(), label_width), width = label_width));
+            for bar in bar_start..bar_end {
+                print!("|");
+                for sub in 0..subdivisions_per_bar {
+                    if source_grids[src_idx].contains(&(bar, sub)) {
+                        print!("■ ");
+                    } else {
+                        print!("  ");
+                    }
+                }
+            }
+            println!("|  {}", source.id.as_str());
+        }
+        println!();
+    }
+
+    // Summary.
+    if !grid_onsets.is_empty() {
+        let mean_strength: f32 =
+            grid_onsets.iter().map(|o| o.strength).sum::<f32>() / grid_onsets.len() as f32;
+        let mean_qe: f64 =
+            grid_onsets.iter().map(|o| o.quantization_error_beats.abs()).sum::<f64>()
+                / grid_onsets.len() as f64;
+        println!(
+            "  Audio: {} onsets  |  mean strength: {:.2}  |  mean quantization error: {:.4} beats ({:.1} ms)",
+            grid_onsets.len(),
+            mean_strength,
+            mean_qe,
+            mean_qe * 60.0 / time_map.bpm * 1000.0,
+        );
+    }
     for source in sources {
         println!(
             "  {}  |  {:.2} beats  |  {} events  |  {} unique notes  |  PPQ: {}{}",

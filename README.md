@@ -261,17 +261,19 @@ The fixture currently has no tolerance field — comparison is exact. Beat toler
 
 ## Project Status
 
-Feature 1 is complete and the project is runnable. Domain types grow incrementally alongside features.
+Features 1 and 2 are complete and the project is runnable. Domain types grow incrementally alongside features.
 
 ```
 onset-matcher show-onsets --bpm=120 reference.wav
+onset-matcher show-midi --bpm=120 pattern.mid
+onset-matcher compare --audio reference.wav --bpm=120 pattern_a.mid pattern_b.mid
 ```
 
 The planned feature milestones are:
 
 **Feature 1 — `show-onsets`** ✅: Load audio, detect onsets, map to beat grid, render as a text grid in the terminal. Requires user to supply `--bpm`.
 
-**Feature 2 — MIDI display**: Load MIDI files, display their event patterns in the same console grid alongside the audio onsets.
+**Feature 2 — `show-midi` / `compare`** ✅: Load MIDI files, display their note-on events in the same console grid format (`show-midi`); display audio onsets and MIDI notes together on one shared grid (`compare`). BPM is read from the MIDI tempo track or supplied via `--bpm`.
 
 **Feature 3 — Arrangement scoring**: Given user-specified MIDI layer placements, score them against the audio onset curve and show how well the MIDI explains the audio.
 
