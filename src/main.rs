@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use domain::time::{Seconds, TimeSignature};
+use domain::audio::ObservedOnset;
+use domain::time::{Seconds, TimeMap, TimeSignature};
 use pipeline::audio_analysis::analyze_audio;
 use pipeline::beat_mapper::{build_time_map, map_onsets_to_grid, refine_beat_zero};
 use pipeline::midi_loader::load_midi_sources;
@@ -68,9 +69,16 @@ struct ShowOnsetsArgs {
     #[arg(long, value_name = "THRESHOLD", default_value = "0.15")]
     threshold: f32,
 
-    /// Attempt to auto-refine the beat-zero position from the first strong onset.
-    #[arg(long, default_value = "true")]
+    /// Attempt to auto-refine the beat-zero position by snapping the first strong onset
+    /// to the nearest integer beat. Uses --threshold as the strength filter.
+    /// Mutually exclusive with --trim-audio.
+    #[arg(long, default_value = "true", conflicts_with = "trim_audio")]
     refine_beat_zero: bool,
+
+    /// Place the first detected onset (above --threshold) at beat 0 / bar 1 beat 1.
+    /// Overrides --refine-beat-zero. Mutually exclusive with --refine-beat-zero.
+    #[arg(long, conflicts_with = "refine_beat_zero")]
+    trim_audio: bool,
 
     /// Show onset strength alongside grid markers.
     #[arg(long)]
@@ -190,9 +198,16 @@ struct CompareArgs {
     #[arg(long, value_name = "THRESHOLD", default_value = "0.15")]
     threshold: f32,
 
-    /// Attempt to auto-refine the beat-zero position from the first strong onset.
-    #[arg(long, default_value = "true")]
+    /// Attempt to auto-refine the beat-zero position by snapping the first strong onset
+    /// to the nearest integer beat. Uses --threshold as the strength filter.
+    /// Mutually exclusive with --trim-audio.
+    #[arg(long, default_value = "true", conflicts_with = "trim_audio")]
     refine_beat_zero: bool,
+
+    /// Place the first detected onset (above --threshold) at beat 0 / bar 1 beat 1.
+    /// Overrides --refine-beat-zero. Mutually exclusive with --refine-beat-zero.
+    #[arg(long, conflicts_with = "refine_beat_zero")]
+    trim_audio: bool,
 
     /// Show onset strength alongside audio grid markers.
     #[arg(long)]
@@ -244,9 +259,16 @@ struct ScoreArrangementArgs {
     #[arg(long, value_name = "THRESHOLD", default_value = "0.15")]
     threshold: f32,
 
-    /// Attempt to auto-refine the beat-zero position from the first strong onset.
-    #[arg(long, default_value = "true")]
+    /// Attempt to auto-refine the beat-zero position by snapping the first strong onset
+    /// to the nearest integer beat. Uses --threshold as the strength filter.
+    /// Mutually exclusive with --trim-audio.
+    #[arg(long, default_value = "true", conflicts_with = "trim_audio")]
     refine_beat_zero: bool,
+
+    /// Place the first detected onset (above --threshold) at beat 0 / bar 1 beat 1.
+    /// Overrides --refine-beat-zero. Mutually exclusive with --refine-beat-zero.
+    #[arg(long, conflicts_with = "refine_beat_zero")]
+    trim_audio: bool,
 
     /// Show onset strength alongside audio grid markers.
     #[arg(long)]
@@ -274,6 +296,33 @@ fn main() -> Result<()> {
         Command::Compare(args) => run_compare(args),
         Command::ScoreArrangement(args) => run_score_arrangement(args),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Beat-zero mode helper (shared by all audio subcommands)
+// ---------------------------------------------------------------------------
+
+/// Apply the user's beat-zero strategy and return the (possibly updated) [`TimeMap`].
+///
+/// Strategy priority:
+/// 1. `trim_audio` — place the first onset above `threshold` exactly at beat 0.
+/// 2. `refine` — snap the first beat to the nearest integer beat (default).
+/// 3. Neither — return the time map unchanged.
+fn apply_beat_zero_mode(
+    time_map: TimeMap,
+    onsets: &[ObservedOnset],
+    refine: bool,
+    trim: bool,
+    threshold: f32,
+) -> TimeMap {
+    if trim {
+        if let Some(first) = onsets.iter().find(|o| o.strength >= threshold) {
+            return TimeMap::new(time_map.bpm, time_map.time_signature, first.time_seconds);
+        }
+    } else if refine && !onsets.is_empty() {
+        return refine_beat_zero(onsets, &time_map, threshold);
+    }
+    time_map
 }
 
 // ---------------------------------------------------------------------------
@@ -307,10 +356,8 @@ fn run_show_onsets(args: ShowOnsetsArgs) -> Result<()> {
     let time_sig = TimeSignature::new(args.time_sig_num, args.time_sig_den);
     let mut time_map = build_time_map(args.bpm, time_sig, Seconds(0.0));
 
-    if args.refine_beat_zero && !analysis.observed_onsets.is_empty() {
-        time_map = refine_beat_zero(&analysis.observed_onsets, &time_map, 0.3);
-        println!("  Beat-zero refined to: {:.4}s", time_map.beat_zero_seconds.0);
-    }
+    time_map = apply_beat_zero_mode(time_map, &analysis.observed_onsets, args.refine_beat_zero, args.trim_audio, args.threshold);
+    println!("  Beat-zero: {:.4}s", time_map.beat_zero_seconds.0);
 
     let grid_onsets = map_onsets_to_grid(&analysis.observed_onsets, &time_map, args.subdivision);
 
@@ -421,10 +468,8 @@ fn run_compare(args: CompareArgs) -> Result<()> {
     let time_sig = TimeSignature::new(args.time_sig_num, args.time_sig_den);
     let mut time_map = build_time_map(effective_bpm, time_sig, Seconds(0.0));
 
-    if args.refine_beat_zero && !analysis.observed_onsets.is_empty() {
-        time_map = refine_beat_zero(&analysis.observed_onsets, &time_map, 0.3);
-        println!("  Beat-zero refined to: {:.4}s", time_map.beat_zero_seconds.0);
-    }
+    time_map = apply_beat_zero_mode(time_map, &analysis.observed_onsets, args.refine_beat_zero, args.trim_audio, args.threshold);
+    println!("  Beat-zero: {:.4}s", time_map.beat_zero_seconds.0);
 
     let grid_onsets = map_onsets_to_grid(&analysis.observed_onsets, &time_map, args.subdivision);
 
@@ -490,10 +535,8 @@ fn run_score_arrangement(args: ScoreArrangementArgs) -> Result<()> {
     let time_sig = TimeSignature::new(args.time_sig_num, args.time_sig_den);
     let mut time_map = build_time_map(effective_bpm, time_sig, Seconds(0.0));
 
-    if args.refine_beat_zero && !analysis.observed_onsets.is_empty() {
-        time_map = refine_beat_zero(&analysis.observed_onsets, &time_map, 0.3);
-        println!("  Beat-zero refined to: {:.4}s", time_map.beat_zero_seconds.0);
-    }
+    time_map = apply_beat_zero_mode(time_map, &analysis.observed_onsets, args.refine_beat_zero, args.trim_audio, args.threshold);
+    println!("  Beat-zero: {:.4}s", time_map.beat_zero_seconds.0);
 
     let grid_onsets = map_onsets_to_grid(&analysis.observed_onsets, &time_map, args.subdivision);
 
