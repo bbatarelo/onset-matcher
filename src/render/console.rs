@@ -80,7 +80,7 @@ pub fn render_onsets(
         for bar in bar_start..bar_end {
             let bar_label = format!(" Bar {:>3} ", bar + 1);
             // Each bar occupies subdivisions_per_bar * 2 chars + 1 separator.
-            let bar_width = subdivisions_per_bar * 2 + 1;
+            let bar_width = subdivisions_per_bar * 2;
             let label = format!("{:^width$}", bar_label, width = bar_width);
             print!("|{}", label);
         }
