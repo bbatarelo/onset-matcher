@@ -151,18 +151,23 @@ pub fn render_onsets(
 /// Each MIDI source gets its own labeled row within each bar's cell.
 /// A `■` marker indicates a note-on event in that subdivision.
 /// If multiple notes fire in the same subdivision they still show as one `■`.
+///
+/// `offsets` is a per-source beat offset (same length as `sources`).
+/// Pass `&[]` or a slice of zeros to start all sources at beat 0.
 pub fn render_midi_sources(
     sources: &[MidiSource],
+    offsets: &[f64],
     time_map: &TimeMap,
     config: &ConsoleRendererConfig,
 ) {
     let beats_per_bar = time_map.time_signature.beats_per_bar();
     let subdivisions_per_bar = (beats_per_bar / config.subdivision).round() as usize;
 
-    // Find the longest source to determine total bars.
+    // Find the end beat of each source (its length + its offset).
     let max_beats = sources
         .iter()
-        .map(|s| s.length_beats.0)
+        .enumerate()
+        .map(|(i, s)| s.length_beats.0 + offsets.get(i).copied().unwrap_or(0.0))
         .fold(0.0_f64, f64::max);
     let total_bars = (max_beats / beats_per_bar).ceil() as usize;
 
@@ -175,13 +180,16 @@ pub fn render_midi_sources(
         sources.len(),
     );
 
-    // For each source, build a (bar, sub_idx) -> bool lookup.
+    // For each source, build a (bar, sub_idx) -> bool lookup applying the offset.
     let source_grids: Vec<std::collections::HashSet<(usize, usize)>> = sources
         .iter()
-        .map(|source| {
+        .enumerate()
+        .map(|(i, source)| {
+            let offset = offsets.get(i).copied().unwrap_or(0.0);
             let mut grid = std::collections::HashSet::new();
             for event in &source.events {
-                let global_beat = event.beat.0;
+                let global_beat = event.beat.0 + offset;
+                if global_beat < 0.0 { continue; }
                 let bar = (global_beat / beats_per_bar).floor() as usize;
                 let beat_in_bar = global_beat % beats_per_bar;
                 let sub_idx = (beat_in_bar / config.subdivision).round() as usize;
@@ -266,24 +274,27 @@ pub fn render_midi_sources(
 ///   - One audio onset row labelled "audio" (onset strength markers: `·` `•` `●`)
 ///   - One row per MIDI source (note markers: `■`)
 ///
-/// The grid span is the longer of the audio duration and the longest MIDI source.
+/// `offsets` is a per-source beat offset (same length as `sources`).
+/// The grid span is the longer of the audio duration and the longest offset MIDI source.
 pub fn render_compare(
     grid_onsets: &[GridOnset],
     audio_duration_seconds: f64,
     sources: &[MidiSource],
+    offsets: &[f64],
     time_map: &TimeMap,
     config: &ConsoleRendererConfig,
 ) {
     let beats_per_bar = time_map.time_signature.beats_per_bar();
     let subdivisions_per_bar = (beats_per_bar / config.subdivision).round() as usize;
 
-    // Total span: max of audio and MIDI.
+    // Total span: max of audio and MIDI (including offsets).
     let audio_beats =
         (audio_duration_seconds - time_map.beat_zero_seconds.0).max(0.0)
             / time_map.seconds_per_beat();
     let midi_beats = sources
         .iter()
-        .map(|s| s.length_beats.0)
+        .enumerate()
+        .map(|(i, s)| s.length_beats.0 + offsets.get(i).copied().unwrap_or(0.0))
         .fold(0.0_f64, f64::max);
     let total_beats = audio_beats.max(midi_beats);
     let total_bars = (total_beats / beats_per_bar).ceil() as usize;
@@ -312,13 +323,16 @@ pub fn render_compare(
         }
     }
 
-    // Build per-source MIDI lookup: (bar, sub_idx) -> present.
+    // Build per-source MIDI lookup applying offsets: (bar, sub_idx) -> present.
     let source_grids: Vec<std::collections::HashSet<(usize, usize)>> = sources
         .iter()
-        .map(|source| {
+        .enumerate()
+        .map(|(i, source)| {
+            let offset = offsets.get(i).copied().unwrap_or(0.0);
             let mut grid = std::collections::HashSet::new();
             for event in &source.events {
-                let global_beat = event.beat.0;
+                let global_beat = event.beat.0 + offset;
+                if global_beat < 0.0 { continue; }
                 let bar = (global_beat / beats_per_bar).floor() as usize;
                 let beat_in_bar = global_beat % beats_per_bar;
                 let sub_idx = (beat_in_bar / config.subdivision).round() as usize;
