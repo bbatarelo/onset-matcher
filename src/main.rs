@@ -41,8 +41,9 @@ enum Command {
 #[derive(clap::Args, Debug)]
 struct ShowOnsetsArgs {
     /// Path to the audio file (WAV, FLAC, MP3, OGG, etc.).
-    #[arg(value_name = "AUDIO_FILE")]
-    audio: PathBuf,
+    /// Consistent with other subcommands; required at runtime.
+    #[arg(long, value_name = "AUDIO_FILE")]
+    audio: Option<PathBuf>,
 
     /// Tempo in beats per minute.
     #[arg(long, value_name = "BPM")]
@@ -330,6 +331,9 @@ fn apply_beat_zero_mode(
 // ---------------------------------------------------------------------------
 
 fn run_show_onsets(args: ShowOnsetsArgs) -> Result<()> {
+    let audio_path = args.audio
+        .ok_or_else(|| anyhow::anyhow!("--audio <AUDIO_FILE> is required for show-onsets"))?;
+
     if args.bpm <= 0.0 {
         anyhow::bail!("BPM must be greater than 0");
     }
@@ -337,10 +341,10 @@ fn run_show_onsets(args: ShowOnsetsArgs) -> Result<()> {
         anyhow::bail!("subdivision must be between 0.0 and 4.0");
     }
 
-    println!("Loading audio: {}", args.audio.display());
+    println!("Loading audio: {}", audio_path.display());
 
-    let mut analysis = analyze_audio(&args.audio)
-        .with_context(|| format!("Failed to analyse audio file: {}", args.audio.display()))?;
+    let mut analysis = analyze_audio(&audio_path)
+        .with_context(|| format!("Failed to analyse audio file: {}", audio_path.display()))?;
 
     let duration = analysis.onset_curve.duration_seconds();
     println!(

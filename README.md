@@ -259,23 +259,128 @@ The fixture currently has no tolerance field — comparison is exact. Beat toler
 
 ---
 
+## Usage Examples
+
+All subcommands are built and runnable. Replace file paths with your own.
+
+### `show-onsets` — visualise audio onsets on a beat grid
+
+```sh
+# Minimum: supply audio file and BPM
+onset-matcher show-onsets --audio reference.wav --bpm 120
+
+# With 16th-note grid, onset strength column, and sparkline
+onset-matcher show-onsets --audio reference.wav --bpm 120 \
+  --subdivision 0.25 --show-strength --show-curve
+
+# Trim the grid so beat 0 starts at the first detected onset
+onset-matcher show-onsets --audio reference.wav --bpm 120 --trim-audio
+
+# Disable auto beat-zero refinement (use raw BPM alignment)
+onset-matcher show-onsets --audio reference.wav --bpm 120 --no-refine-beat-zero
+
+# Raise the detection threshold (fewer, stronger onsets)
+onset-matcher show-onsets --audio reference.wav --bpm 120 --threshold 0.3
+```
+
+### `show-midi` — visualise MIDI note events on a beat grid
+
+```sh
+# Single file — BPM read from the MIDI tempo track
+onset-matcher show-midi -m pattern.mid
+
+# Explicit BPM override
+onset-matcher show-midi --bpm 120 -m pattern.mid
+
+# Two files, second starts at beat 8
+onset-matcher show-midi --bpm 120 -m intro.mid=0 -m verse.mid=8
+
+# Same file repeated at different offsets
+onset-matcher show-midi --bpm 120 -m loop.mid=0 -m loop.mid=16
+```
+
+### `compare` — audio onsets and MIDI notes on the same grid
+
+```sh
+# Minimum: audio + one MIDI file
+onset-matcher compare --audio reference.wav -m pattern.mid
+
+# Multiple MIDI files with explicit beat offsets
+onset-matcher compare --audio reference.wav --bpm 120 \
+  -m intro.mid=0 -m verse.mid=8 -m chorus.mid=24
+
+# Show onset strength and sparkline
+onset-matcher compare --audio reference.wav -m pattern.mid \
+  --show-strength --show-curve
+
+# Trim audio so bar 1 starts at first onset
+onset-matcher compare --audio reference.wav -m pattern.mid --trim-audio
+```
+
+### `score-arrangement` — score how well explicit MIDI placements explain the audio
+
+```sh
+# Minimum: audio + at least one MIDI file with beat offset
+onset-matcher score-arrangement --audio reference.wav \
+  -m pattern.mid=0
+
+# Multiple layers (same file repeated, or different patterns)
+onset-matcher score-arrangement --audio reference.wav --bpm 120 \
+  -m intro.mid=0 -m verse.mid=8 -m verse.mid=16 -m chorus.mid=24
+
+# Relax the beat-matching tolerance (default 0.5 beat)
+onset-matcher score-arrangement --audio reference.wav \
+  -m pattern.mid=0 --match-tolerance 1.0
+
+# Fine-tune threshold + show visual grid
+onset-matcher score-arrangement --audio reference.wav \
+  -m pattern.mid=0 --threshold 0.2 --show-strength --trim-audio
+```
+
+---
+
+### Common flags (all audio subcommands)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--audio <FILE>` | — | Reference audio file (WAV, FLAC, MP3, OGG, …) |
+| `--bpm <N>` | from MIDI | Tempo; required for `show-onsets`, optional elsewhere |
+| `--time-sig-num <N>` | `4` | Beats per bar |
+| `--time-sig-den <N>` | `4` | Beat note value |
+| `--subdivision <N>` | `0.25` | Grid resolution (0.25 = 16th, 0.5 = 8th, 1.0 = quarter) |
+| `--bars-per-row <N>` | `4` | Terminal layout width |
+| `--threshold <N>` | `0.15` | Onset detection sensitivity (lower = more onsets) |
+| `--refine-beat-zero` | `true` | Snap beat 0 to nearest integer beat from first strong onset |
+| `--trim-audio` | off | Set beat 0 = first onset ≥ threshold (exclusive with `--refine-beat-zero`) |
+| `--show-strength` | off | Print onset strength value next to each onset marker |
+| `--show-curve` | off | Print ASCII sparkline of the onset-strength curve |
+
+### `--midi-file` / `-m` flag
+
+```sh
+-m path/to/file.mid          # beat offset defaults to 0
+-m path/to/file.mid=8        # beat offset = 8
+-m path/to/file.mid=8.5      # fractional beat offsets are fine
+```
+
+The flag is repeatable. The same file may appear multiple times at different offsets.
+
+---
+
 ## Project Status
 
-Features 1 and 2 are complete and the project is runnable. Domain types grow incrementally alongside features.
-
-```
-onset-matcher show-onsets --bpm=120 reference.wav
-onset-matcher show-midi --bpm=120 pattern.mid
-onset-matcher compare --audio reference.wav --bpm=120 pattern_a.mid pattern_b.mid
-```
+Features 1–3 are complete and the project is runnable. Domain types grow incrementally alongside features.
 
 The planned feature milestones are:
 
-**Feature 1 — `show-onsets`** ✅: Load audio, detect onsets, map to beat grid, render as a text grid in the terminal. Requires user to supply `--bpm`.
+**Feature 1 — `show-onsets`** ✅
+Load audio, detect onsets, map to beat grid, render as a text grid in the terminal.
 
-**Feature 2 — `show-midi` / `compare`** ✅: Load MIDI files, display their note-on events in the same console grid format (`show-midi`); display audio onsets and MIDI notes together on one shared grid (`compare`). BPM is read from the MIDI tempo track or supplied via `--bpm`.
+**Feature 2 — `show-midi` / `compare`** ✅
+Load MIDI files, display their note-on events in the same console grid format (`show-midi`); display audio onsets and MIDI notes together on one shared grid (`compare`). BPM is read from the MIDI tempo track or supplied via `--bpm`.
 
-**Feature 3 — Arrangement scoring**: Given user-specified MIDI layer placements, score them against the audio onset curve and show how well the MIDI explains the audio.
+**Feature 3 — Arrangement scoring** ✅
+Given user-specified MIDI layer placements (via `-m file=beat_offset`), score them against the audio onset curve and show per-cluster match diagnostics.
 
 **Feature 4 — Arrangement search**: Automatically search for the arrangement of MIDI layers that best explains the audio.
 
