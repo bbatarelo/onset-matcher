@@ -337,6 +337,34 @@ onset-matcher score-arrangement --audio reference.wav \
   -m pattern.mid=0 --threshold 0.2 --show-strength --trim-audio
 ```
 
+### `find-arrangement` — automatically find the best beat offsets for MIDI files
+
+```sh
+# Single source: try offset 0 only (equivalent to score-arrangement with offset=0)
+onset-matcher find-arrangement --audio reference.wav -m pattern.mid
+
+# Search offsets 0–32 in steps of 4 beats (every bar in 4/4)
+onset-matcher find-arrangement --audio reference.wav \
+  -m intro.mid --search-min 0 --search-max 32 --search-step 4
+
+# Two sources: search all combinations of 0..16 in 1-beat steps
+onset-matcher find-arrangement --audio reference.wav --bpm 120 \
+  -m verse.mid -m fill.mid \
+  --search-min 0 --search-max 16 --search-step 1
+
+# Widen the Gaussian template window (more tolerant of timing variation)
+onset-matcher find-arrangement --audio reference.wav \
+  -m pattern.mid --search-max 8 --event-window 0.05
+
+# Show both onset curves (audio + expected) as sparklines
+onset-matcher find-arrangement --audio reference.wav \
+  -m pattern.mid --search-max 8 --show-curve --show-expected-curve
+
+# Trim audio beat-zero before searching
+onset-matcher find-arrangement --audio reference.wav \
+  -m pattern.mid --search-max 8 --trim-audio
+```
+
 ---
 
 ### Common flags (all audio subcommands)
@@ -382,7 +410,8 @@ Load MIDI files, display their note-on events in the same console grid format (`
 **Feature 3 — Arrangement scoring** ✅
 Given user-specified MIDI layer placements (via `-m file=beat_offset`), score them against the audio onset curve and show per-cluster match diagnostics.
 
-**Feature 4 — Arrangement search**: Automatically search for the arrangement of MIDI layers that best explains the audio.
+**Feature 4 — Arrangement search** ✅
+Automatically search for the beat offsets for each MIDI file that maximise overlap with the audio onset curve (`find-arrangement`). Uses Gaussian-bump cross-correlation: for each candidate arrangement, a continuous expected-onset curve is generated and scored against the audio. Search space is controlled by `--search-min`, `--search-max`, `--search-step` (per source). Displays the best arrangement on the console grid with properly calibrated audio alignment.
 
 **Feature 5 — Canonical export**: Compute diagnostics and produce both output files (`canonical.json` and `test-fixture.json`).
 

@@ -12,6 +12,7 @@ use pipeline::audio_analysis::analyze_audio;
 use pipeline::beat_mapper::{build_time_map, map_onsets_to_grid, refine_beat_zero};
 use pipeline::midi_loader::load_midi_sources;
 use pipeline::onset_detection::{PeakPickerConfig, detect_onsets};
+use pipeline::search::{find_best_arrangement, render_expected_curve};
 use render::console::{ConsoleRendererConfig, render_compare, render_midi_sources, render_onset_curve_sparkline, render_onsets};
 
 /// onset-matcher: MIDI-guided reference-audio alignment and arrangement inference tool.
@@ -32,6 +33,8 @@ enum Command {
     Compare(CompareArgs),
     /// Score how well a user-specified MIDI arrangement explains the reference audio.
     ScoreArrangement(ScoreArrangementArgs),
+    /// Automatically search for the best beat offsets for the given MIDI files.
+    FindArrangement(FindArrangementArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -96,23 +99,29 @@ struct ShowOnsetsArgs {
 
 /// Parse a `--midi-file` value of the form `<path>` or `<path>=<beat_offset>`.
 ///
-/// Returns `(path, beat_offset)`. The offset defaults to `0.0` if no `=` is present.
+/// Returns `(path, pinned_offset)`.
+/// - `None`      — no `=` present; caller should search over a configured range.
+/// - `Some(n)`   — explicit `=n` present; caller should pin this source to beat `n`.
+///
 /// The split is on the **last** `=` so Windows paths like `C:\foo\bar.mid=8` work.
-fn parse_midi_file_spec(s: &str) -> Result<(PathBuf, f64)> {
+fn parse_midi_file_spec(s: &str) -> Result<(PathBuf, Option<f64>)> {
     if let Some(eq_pos) = s.rfind('=') {
         let path_str = &s[..eq_pos];
         let offset_str = &s[eq_pos + 1..];
         let offset: f64 = offset_str
             .parse()
             .with_context(|| format!("Invalid beat offset '{}' in --midi-file spec '{}'", offset_str, s))?;
-        Ok((PathBuf::from(path_str), offset))
+        Ok((PathBuf::from(path_str), Some(offset)))
     } else {
-        Ok((PathBuf::from(s), 0.0))
+        Ok((PathBuf::from(s), None))
     }
 }
 
-/// Parse all `--midi-file` specs and return separate `(paths, offsets)` vecs.
-fn parse_midi_specs(specs: &[String]) -> Result<(Vec<PathBuf>, Vec<f64>)> {
+/// Parse all `--midi-file` specs and return separate `(paths, pinned_offsets)` vecs.
+///
+/// `pinned_offsets[i]` is `None` when no `=` was given (search freely) or `Some(n)`
+/// when the user explicitly specified `=n` (pin to beat `n`).
+fn parse_midi_specs(specs: &[String]) -> Result<(Vec<PathBuf>, Vec<Option<f64>>)> {
     let mut paths = Vec::with_capacity(specs.len());
     let mut offsets = Vec::with_capacity(specs.len());
     for s in specs {
@@ -121,6 +130,12 @@ fn parse_midi_specs(specs: &[String]) -> Result<(Vec<PathBuf>, Vec<f64>)> {
         offsets.push(o);
     }
     Ok((paths, offsets))
+}
+
+/// Flatten pinned offsets to concrete `f64` values for rendering / scoring.
+/// `None` → 0.0 (default start beat).
+fn flatten_offsets(pinned: &[Option<f64>]) -> Vec<f64> {
+    pinned.iter().map(|o| o.unwrap_or(0.0)).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +301,89 @@ struct ScoreArrangementArgs {
 }
 
 // ---------------------------------------------------------------------------
+// find-arrangement
+// ---------------------------------------------------------------------------
+
+#[derive(clap::Args, Debug)]
+struct FindArrangementArgs {
+    /// Path to the reference audio file.
+    #[arg(long, value_name = "AUDIO_FILE")]
+    audio: PathBuf,
+
+    /// MIDI file(s) to search offsets for.  Format: <path> or <path>=<hint_beat>.
+    /// If a beat offset is given (e.g. `-m loop.mid=8`) it is used as the search
+    /// start point for that file; the search still explores the full configured range.
+    /// Use the same file multiple times to place independent layer instances.
+    #[arg(short = 'm', long = "midi-file", value_name = "PATH[=BEAT]", required = true)]
+    midi_file: Vec<String>,
+
+    /// Tempo in BPM. Required if no MIDI file has an embedded tempo track.
+    #[arg(long, value_name = "BPM")]
+    bpm: Option<f64>,
+
+    /// Time signature numerator (beats per bar). Default: 4.
+    #[arg(long, value_name = "NUMERATOR", default_value = "4")]
+    time_sig_num: u8,
+
+    /// Time signature denominator. Default: 4.
+    #[arg(long, value_name = "DENOMINATOR", default_value = "4")]
+    time_sig_den: u8,
+
+    /// Beat subdivision for the grid display. Default: 0.25 (16th notes).
+    #[arg(long, value_name = "SUBDIVISION", default_value = "0.25")]
+    subdivision: f64,
+
+    /// Number of bars to display per row. Default: 4.
+    #[arg(long, value_name = "N", default_value = "4")]
+    bars_per_row: usize,
+
+    /// Onset detection threshold (0.0–1.0). Default: 0.15.
+    #[arg(long, value_name = "THRESHOLD", default_value = "0.15")]
+    threshold: f32,
+
+    /// Attempt to auto-refine the beat-zero position before the search.
+    /// Mutually exclusive with --trim-audio.
+    #[arg(long, default_value = "true", conflicts_with = "trim_audio")]
+    refine_beat_zero: bool,
+
+    /// Place the first detected onset at beat 0 before the search.
+    /// Mutually exclusive with --refine-beat-zero.
+    #[arg(long, conflicts_with = "refine_beat_zero")]
+    trim_audio: bool,
+
+    /// Show onset strength alongside audio grid markers.
+    #[arg(long)]
+    show_strength: bool,
+
+    /// Show the onset-strength curve as an ASCII sparkline before the grid.
+    #[arg(long)]
+    show_curve: bool,
+
+    /// Show the expected-onset curve generated from the best arrangement.
+    #[arg(long)]
+    show_expected_curve: bool,
+
+    /// Minimum beat offset to try for each source (inclusive). Default: 0.
+    #[arg(long, value_name = "BEATS", default_value = "0.0")]
+    search_min: f64,
+
+    /// Maximum beat offset to try for each source (inclusive). Default: 0.
+    /// Set this above --search-min to enable a range search.
+    #[arg(long, value_name = "BEATS", default_value = "0.0")]
+    search_max: f64,
+
+    /// Beat step between candidate offsets. Default: 1.0 (search on bar lines at
+    /// 4/4 quarter notes = every beat; set to 4.0 for whole-bar steps, etc.).
+    #[arg(long, value_name = "BEATS", default_value = "1.0")]
+    search_step: f64,
+
+    /// Gaussian window width (seconds) placed at each MIDI note-on event when
+    /// building the expected-onset template. Default: 0.025 (25 ms).
+    #[arg(long, value_name = "SECONDS", default_value = "0.025")]
+    event_window: f64,
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -296,6 +394,7 @@ fn main() -> Result<()> {
         Command::ShowMidi(args) => run_show_midi(args),
         Command::Compare(args) => run_compare(args),
         Command::ScoreArrangement(args) => run_score_arrangement(args),
+        Command::FindArrangement(args) => run_find_arrangement(args),
     }
 }
 
@@ -393,8 +492,9 @@ fn run_show_midi(args: ShowMidiArgs) -> Result<()> {
         anyhow::bail!("subdivision must be between 0.0 and 4.0");
     }
 
-    let (paths, offsets) = parse_midi_specs(&args.midi_file)?;
+    let (paths, pinned_offsets) = parse_midi_specs(&args.midi_file)?;
     let path_refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+    let offsets = flatten_offsets(&pinned_offsets);
 
     println!("Loading {} MIDI file(s)...", path_refs.len());
     for (p, o) in paths.iter().zip(offsets.iter()) {
@@ -438,8 +538,9 @@ fn run_compare(args: CompareArgs) -> Result<()> {
     }
 
     // --- Load MIDI sources ---
-    let (midi_paths, offsets) = parse_midi_specs(&args.midi_file)?;
+    let (midi_paths, pinned_offsets) = parse_midi_specs(&args.midi_file)?;
     let midi_path_refs: Vec<&std::path::Path> = midi_paths.iter().map(|p| p.as_path()).collect();
+    let offsets = flatten_offsets(&pinned_offsets);
     println!("Loading {} MIDI file(s)...", midi_path_refs.len());
     for (p, o) in midi_paths.iter().zip(offsets.iter()) {
         if *o == 0.0 {
@@ -509,8 +610,9 @@ fn run_score_arrangement(args: ScoreArrangementArgs) -> Result<()> {
     }
 
     // --- Load MIDI sources ---
-    let (midi_paths, offsets) = parse_midi_specs(&args.midi_file)?;
+    let (midi_paths, pinned_offsets) = parse_midi_specs(&args.midi_file)?;
     let midi_path_refs: Vec<&std::path::Path> = midi_paths.iter().map(|p| p.as_path()).collect();
+    let offsets = flatten_offsets(&pinned_offsets);
     println!("Loading {} MIDI file(s)...", midi_path_refs.len());
     for (p, o) in midi_paths.iter().zip(offsets.iter()) {
         println!("  {} (offset: {} beats)", p.display(), o);
@@ -661,6 +763,149 @@ fn run_score_arrangement(args: ScoreArrangementArgs) -> Result<()> {
         }
     }
     println!();
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// find-arrangement implementation
+// ---------------------------------------------------------------------------
+
+fn run_find_arrangement(args: FindArrangementArgs) -> Result<()> {
+    if let Some(bpm) = args.bpm {
+        if bpm <= 0.0 {
+            anyhow::bail!("BPM must be greater than 0");
+        }
+    }
+    if args.subdivision <= 0.0 || args.subdivision > 4.0 {
+        anyhow::bail!("subdivision must be between 0.0 and 4.0");
+    }
+    if args.search_step <= 0.0 {
+        anyhow::bail!("--search-step must be greater than 0");
+    }
+    if args.search_max < args.search_min {
+        anyhow::bail!("--search-max must be >= --search-min");
+    }
+
+    // --- Load MIDI sources ---
+    let (midi_paths, pinned_offsets) = parse_midi_specs(&args.midi_file)?;
+    let midi_path_refs: Vec<&std::path::Path> = midi_paths.iter().map(|p| p.as_path()).collect();
+    println!("Loading {} MIDI file(s)...", midi_path_refs.len());
+    for (p, pin) in midi_paths.iter().zip(pinned_offsets.iter()) {
+        match pin {
+            Some(o) => println!("  {} (pinned to beat {})", p.display(), o),
+            None    => println!("  {} (offset will be searched)", p.display()),
+        }
+    }
+    let (sources, effective_bpm) = load_midi_sources(&midi_path_refs, args.bpm)
+        .context("Failed to load MIDI files")?;
+    println!("  Effective BPM: {:.1}", effective_bpm);
+
+    // --- Load and analyse audio ---
+    println!("Loading audio: {}", args.audio.display());
+    let mut analysis = analyze_audio(&args.audio)
+        .with_context(|| format!("Failed to analyse audio file: {}", args.audio.display()))?;
+
+    let duration = analysis.onset_curve.duration_seconds();
+    println!(
+        "  Sample rate: {} Hz  |  Duration: {:.2}s  |  {} onset frames",
+        analysis.sample_rate, duration.0, analysis.onset_curve.values.len(),
+    );
+
+    let picker_config = PeakPickerConfig { threshold: args.threshold, ..Default::default() };
+    let onsets = detect_onsets(&analysis.onset_curve, &picker_config);
+    analysis.observed_onsets = onsets;
+    println!("  Detected {} onset peaks (threshold: {})", analysis.observed_onsets.len(), args.threshold);
+
+    // --- Build initial TimeMap ---
+    let time_sig = TimeSignature::new(args.time_sig_num, args.time_sig_den);
+    let mut time_map = build_time_map(effective_bpm, time_sig, Seconds(0.0));
+    time_map = apply_beat_zero_mode(time_map, &analysis.observed_onsets, args.refine_beat_zero, args.trim_audio, args.threshold);
+    println!("  Beat-zero: {:.4}s", time_map.beat_zero_seconds.0);
+
+    // --- Build per-source candidate offset lists ---
+    // Pinned sources (=N on the command line) get a single candidate [N].
+    // Free sources (no =) get the full search range [search_min..search_max step search_step].
+    let free_candidates: Vec<f64> = {
+        let mut v = Vec::new();
+        let mut o = args.search_min;
+        while o <= args.search_max + 1e-9 {
+            v.push(o);
+            o += args.search_step;
+        }
+        v
+    };
+
+    let per_source_candidates: Vec<Vec<f64>> = pinned_offsets
+        .iter()
+        .map(|pin| match pin {
+            Some(n) => vec![*n],
+            None    => free_candidates.clone(),
+        })
+        .collect();
+
+    // Warn about large searches.
+    let total_candidates: usize = per_source_candidates.iter().map(|c| c.len()).product::<usize>().max(1);
+    let n_free = pinned_offsets.iter().filter(|p| p.is_none()).count();
+    let n_pinned = pinned_offsets.iter().filter(|p| p.is_some()).count();
+    println!();
+    println!(
+        "  Search: {} free source(s) × {} offsets [{:.1}..{:.1} step {:.1} beats]  +  {} pinned  =  {} candidates",
+        n_free, free_candidates.len(), args.search_min, args.search_max, args.search_step,
+        n_pinned, total_candidates
+    );
+    if total_candidates > 100_000 {
+        println!(
+            "  WARNING: {} candidates may be slow. Increase --search-step or narrow range.",
+            total_candidates
+        );
+    }
+
+    // --- Run search ---
+    let result = find_best_arrangement(
+        &sources,
+        &analysis.onset_curve,
+        &time_map,
+        &per_source_candidates,
+        args.event_window,
+    );
+
+    println!();
+    println!("  Best arrangement found (overlap score: {:.4}):", result.score);
+    for (p, offset) in midi_paths.iter().zip(result.best_offsets.iter()) {
+        println!("    {}  offset: {:.2} beats", p.display(), offset);
+    }
+
+    // --- Optional sparkline display ---
+    if args.show_curve {
+        println!();
+        println!("  Audio onset curve:");
+        render_onset_curve_sparkline(&analysis.onset_curve.values, 80);
+    }
+    if args.show_expected_curve {
+        let expected = render_expected_curve(
+            &sources,
+            &result.best_offsets,
+            &analysis.onset_curve,
+            &time_map,
+            args.event_window,
+        );
+        println!();
+        println!("  Expected onset curve (best arrangement):");
+        render_onset_curve_sparkline(&expected, 80);
+    }
+
+    // --- Render compare grid with best offsets ---
+    let grid_onsets = map_onsets_to_grid(&analysis.observed_onsets, &time_map, args.subdivision);
+
+    let render_config = ConsoleRendererConfig {
+        subdivision: args.subdivision,
+        bars_per_row: args.bars_per_row,
+        show_strength: args.show_strength,
+    };
+
+    println!();
+    render_compare(&grid_onsets, duration.0, &sources, &result.best_offsets, &time_map, &render_config);
 
     Ok(())
 }
