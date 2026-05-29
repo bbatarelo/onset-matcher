@@ -337,33 +337,99 @@ onset-matcher score-arrangement --audio reference.wav \
   -m pattern.mid=0 --threshold 0.2 --show-strength --trim-audio
 ```
 
-### `find-arrangement` — automatically find the best beat offsets for MIDI files
+### `find-arrangement` — automatically find BPM and beat offsets for MIDI files
+
+`find-arrangement` runs two nested searches simultaneously:
+
+1. **BPM search** (`--bpm`) — finds the true recording tempo.
+2. **Offset search** (`--search-min/max/step`) — finds where each MIDI file starts (in beats) relative to beat zero.
+
+Both searches are scored by the same Gaussian-bump cross-correlation metric and are
+evaluated as a joint outer-product: every `(BPM, offsets)` combination is tried, and
+the one with the highest overlap score wins.
+
+#### BPM modes
+
+| `--bpm` value | Behaviour |
+|---|---|
+| `auto-grid` (default) | Try every BPM in `[--bpm-min .. --bpm-max]` at `--bpm-step` increments |
+| A number, e.g. `110` | Use that fixed BPM (single evaluation; fastest) |
+
+When `--bpm=auto-grid`, the MIDI file must have an embedded tempo track so the tool
+can resolve MIDI ticks to beats. If the MIDI has no tempo track, supply a fixed BPM
+explicitly (e.g. `--bpm=100`).
+
+#### `--search-min / --search-max / --search-step` — the beat offset search
+
+These control where each MIDI source can start (in beats) relative to beat zero. They
+are **completely independent of the BPM search**.
+
+- Sources with a pinned offset (`-m file.mid=8`) are not searched; they contribute
+  exactly one candidate `[8]` to the Cartesian product.
+- Free sources (`-m file.mid`) are searched over the full `[search-min..search-max]`
+  range at `search-step` resolution.
+
+The default (`--search-min 0 --search-max 0`) puts every free source at beat 0.
+Set `--search-max` to the number of bars you want to cover.
 
 ```sh
-# Single source: try offset 0 only (equivalent to score-arrangement with offset=0)
+# ── Auto-grid BPM (default) ──────────────────────────────────────────────
+
+# Let the tool discover the BPM automatically (default range 60–200, step 1)
 onset-matcher find-arrangement --audio reference.wav -m pattern.mid
 
-# Search offsets 0–32 in steps of 4 beats (every bar in 4/4)
+# Narrow the BPM search and search offsets 0–16 in whole-beat steps
 onset-matcher find-arrangement --audio reference.wav \
+  -m pattern.mid \
+  --bpm=auto-grid --bpm-min 95 --bpm-max 115 --bpm-step 0.5 \
+  --search-min 0 --search-max 16 --search-step 1
+
+# Pin one source (no offset search) while auto-discovering BPM
+onset-matcher find-arrangement --audio reference.wav \
+  -m intro.mid=4 \
+  --bpm=auto-grid --bpm-min 95 --bpm-max 115 --bpm-step 1
+
+# ── Fixed BPM ────────────────────────────────────────────────────────────
+
+# Fixed BPM, single source at beat 0 (no offset search)
+onset-matcher find-arrangement --audio reference.wav --bpm=100 -m pattern.mid
+
+# Fixed BPM, search offsets 0–32 in steps of 4 beats (every bar in 4/4)
+onset-matcher find-arrangement --audio reference.wav --bpm=120 \
   -m intro.mid --search-min 0 --search-max 32 --search-step 4
 
-# Two sources: search all combinations of 0..16 in 1-beat steps
-onset-matcher find-arrangement --audio reference.wav --bpm 120 \
+# Fixed BPM, two sources: search all 0..16 × 0..16 combinations
+onset-matcher find-arrangement --audio reference.wav --bpm=120 \
   -m verse.mid -m fill.mid \
   --search-min 0 --search-max 16 --search-step 1
+
+# ── Diagnostics ──────────────────────────────────────────────────────────
+
+# Show both onset curves (audio + expected) as ASCII sparklines
+onset-matcher find-arrangement --audio reference.wav \
+  -m pattern.mid --search-max 8 --show-curve --show-expected-curve
 
 # Widen the Gaussian template window (more tolerant of timing variation)
 onset-matcher find-arrangement --audio reference.wav \
   -m pattern.mid --search-max 8 --event-window 0.05
 
-# Show both onset curves (audio + expected) as sparklines
-onset-matcher find-arrangement --audio reference.wav \
-  -m pattern.mid --search-max 8 --show-curve --show-expected-curve
-
 # Trim audio beat-zero before searching
 onset-matcher find-arrangement --audio reference.wav \
   -m pattern.mid --search-max 8 --trim-audio
 ```
+
+#### Performance note
+
+Total evaluations = (number of BPM candidates) × (Cartesian product of per-source offset lists).
+
+| Scenario | Evaluations |
+|---|---|
+| `--bpm=100 -m file.mid=4` (fully pinned) | 1 |
+| `--bpm=auto-grid --bpm-min=95 --bpm-max=115 --bpm-step=1 -m file.mid=4` | 21 |
+| `--bpm=auto-grid --bpm-min=95 --bpm-max=115 --bpm-step=0.5 --search-max=16 --search-step=1 -m file.mid` | 41 × 17 = 697 |
+| Two free sources, same as above | 41 × 17² = 11 849 |
+
+Tip: pin sources with known offsets using `=N` syntax; narrow BPM range if you have a rough idea of tempo.
 
 ---
 
@@ -372,7 +438,7 @@ onset-matcher find-arrangement --audio reference.wav \
 | Flag | Default | Meaning |
 |---|---|---|
 | `--audio <FILE>` | — | Reference audio file (WAV, FLAC, MP3, OGG, …) |
-| `--bpm <N>` | from MIDI | Tempo; required for `show-onsets`, optional elsewhere |
+| `--bpm <N\|MODE>` | from MIDI / `auto-grid` | Tempo; see below |
 | `--time-sig-num <N>` | `4` | Beats per bar |
 | `--time-sig-den <N>` | `4` | Beat note value |
 | `--subdivision <N>` | `0.25` | Grid resolution (0.25 = 16th, 0.5 = 8th, 1.0 = quarter) |
@@ -382,6 +448,34 @@ onset-matcher find-arrangement --audio reference.wav \
 | `--trim-audio` | off | Set beat 0 = first onset ≥ threshold (exclusive with `--refine-beat-zero`) |
 | `--show-strength` | off | Print onset strength value next to each onset marker |
 | `--show-curve` | off | Print ASCII sparkline of the onset-strength curve |
+
+### `--bpm` flag details
+
+| Subcommand | `--bpm` type | Notes |
+|---|---|---|
+| `show-onsets` | required `f64` | e.g. `--bpm=120` |
+| `show-midi` | optional `f64` | if omitted, read from MIDI tempo track |
+| `compare` | optional `f64` | if omitted, read from MIDI tempo track |
+| `score-arrangement` | optional `f64` | if omitted, read from MIDI tempo track |
+| `find-arrangement` | string or `auto-grid` | default `auto-grid`; see below |
+
+For `find-arrangement`, `--bpm` accepts either a bare number (`--bpm=100`) or `auto-grid`.
+When `auto-grid` is used, also set:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--bpm-min <N>` | `60` | Lower bound of BPM grid search |
+| `--bpm-max <N>` | `200` | Upper bound of BPM grid search |
+| `--bpm-step <N>` | `1.0` | Step size for BPM grid search |
+
+### `find-arrangement`-specific offset flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--search-min <BEATS>` | `0.0` | Minimum beat offset to try for free sources |
+| `--search-max <BEATS>` | `0.0` | Maximum beat offset to try for free sources (set above `--search-min` to enable range) |
+| `--search-step <BEATS>` | `1.0` | Step between candidate offsets |
+| `--event-window <SEC>` | `0.025` | Gaussian template width in seconds (larger = more tolerant of jitter) |
 
 ### `--midi-file` / `-m` flag
 
@@ -397,7 +491,7 @@ The flag is repeatable. The same file may appear multiple times at different off
 
 ## Project Status
 
-Features 1–3 are complete and the project is runnable. Domain types grow incrementally alongside features.
+Features 1–4b are complete and the project is runnable. Domain types grow incrementally alongside features.
 
 The planned feature milestones are:
 
@@ -413,7 +507,11 @@ Given user-specified MIDI layer placements (via `-m file=beat_offset`), score th
 **Feature 4 — Arrangement search** ✅
 Automatically search for the beat offsets for each MIDI file that maximise overlap with the audio onset curve (`find-arrangement`). Uses Gaussian-bump cross-correlation: for each candidate arrangement, a continuous expected-onset curve is generated and scored against the audio. Search space is controlled by `--search-min`, `--search-max`, `--search-step` (per source). Displays the best arrangement on the console grid with properly calibrated audio alignment.
 
-**Feature 5 — Canonical export**: Compute diagnostics and produce both output files (`canonical.json` and `test-fixture.json`).
+**Feature 4b — Auto-BPM calibration** ✅
+`--bpm=auto-grid` discovers the true recording tempo automatically by trying every BPM in a configurable range and picking the one that produces the highest cross-correlation score with the MIDI onset template. This corrects for clock-rate mismatch between drum machines and DAW exports — e.g. a pattern exported at 100 BPM that was recorded slightly fast at 99.5 BPM effective. `--bpm-min`, `--bpm-max`, `--bpm-step` control the search range (defaults: 60–200 at 1 BPM steps). Combined with per-source offset search: total evaluations = BPM candidates × offset combinations.
+
+**Feature 5 — Canonical export** _(next)_
+Compute diagnostics and produce both output files (`canonical.json` and `test-fixture.json`).
 
 ---
 

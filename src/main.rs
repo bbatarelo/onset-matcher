@@ -12,7 +12,8 @@ use pipeline::audio_analysis::analyze_audio;
 use pipeline::beat_mapper::{build_time_map, map_onsets_to_grid, refine_beat_zero};
 use pipeline::midi_loader::load_midi_sources;
 use pipeline::onset_detection::{PeakPickerConfig, detect_onsets};
-use pipeline::search::{find_best_arrangement, render_expected_curve};
+use pipeline::bpm_search::{BpmMode, OffsetSearchConfig, resolve_bpm};
+use pipeline::search::render_expected_curve;
 use render::console::{ConsoleRendererConfig, render_compare, render_midi_sources, render_onset_curve_sparkline, render_onsets};
 
 /// onset-matcher: MIDI-guided reference-audio alignment and arrangement inference tool.
@@ -317,9 +318,31 @@ struct FindArrangementArgs {
     #[arg(short = 'm', long = "midi-file", value_name = "PATH[=BEAT]", required = true)]
     midi_file: Vec<String>,
 
-    /// Tempo in BPM. Required if no MIDI file has an embedded tempo track.
-    #[arg(long, value_name = "BPM")]
-    bpm: Option<f64>,
+    /// Tempo in BPM, or "auto-grid" to search automatically.
+    ///
+    /// Examples:
+    ///   --bpm=110          (fixed BPM, required if MIDI has no tempo track)
+    ///   --bpm=auto-grid    (search [--bpm-min..--bpm-max] at --bpm-step increments)
+    ///
+    /// When using "auto-grid", the MIDI files must still have an embedded tempo
+    /// track (used only as a reference BPM for MIDI tick resolution, not for the
+    /// search), OR you must supply a fallback via --bpm-fallback (not yet
+    /// implemented). In practice: provide any roughly-correct BPM via a fixed
+    /// value, or rely on the MIDI file tempo, then let auto-grid fine-tune it.
+    #[arg(long, value_name = "BPM_OR_MODE", default_value = "auto-grid")]
+    bpm: String,
+
+    /// Minimum BPM to try when --bpm=auto-grid. Default: 60.
+    #[arg(long, value_name = "BPM", default_value = "60.0")]
+    bpm_min: f64,
+
+    /// Maximum BPM to try when --bpm=auto-grid. Default: 200.
+    #[arg(long, value_name = "BPM", default_value = "200.0")]
+    bpm_max: f64,
+
+    /// BPM step for the auto-grid search. Default: 1.0.
+    #[arg(long, value_name = "BPM", default_value = "1.0")]
+    bpm_step: f64,
 
     /// Time signature numerator (beats per bar). Default: 4.
     #[arg(long, value_name = "NUMERATOR", default_value = "4")]
@@ -367,13 +390,16 @@ struct FindArrangementArgs {
     #[arg(long, value_name = "BEATS", default_value = "0.0")]
     search_min: f64,
 
-    /// Maximum beat offset to try for each source (inclusive). Default: 0.
-    /// Set this above --search-min to enable a range search.
-    #[arg(long, value_name = "BEATS", default_value = "0.0")]
-    search_max: f64,
+    /// Maximum beat offset to try for free (un-pinned) sources (inclusive).
+    /// If omitted, the maximum is derived automatically from the audio duration:
+    ///   max = floor(audio_duration_seconds * bpm / 60.0)
+    /// This ensures every whole-beat start position within the audio is tried.
+    /// Set explicitly to narrow the search range.
+    #[arg(long, value_name = "BEATS")]
+    search_max: Option<f64>,
 
-    /// Beat step between candidate offsets. Default: 1.0 (search on bar lines at
-    /// 4/4 quarter notes = every beat; set to 4.0 for whole-bar steps, etc.).
+    /// Beat step between candidate offsets. Default: 1.0 (every beat).
+    /// Set to 4.0 for whole-bar steps, 0.5 for half-beat steps, etc.
     #[arg(long, value_name = "BEATS", default_value = "1.0")]
     search_step: f64,
 
@@ -772,20 +798,28 @@ fn run_score_arrangement(args: ScoreArrangementArgs) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn run_find_arrangement(args: FindArrangementArgs) -> Result<()> {
-    if let Some(bpm) = args.bpm {
-        if bpm <= 0.0 {
-            anyhow::bail!("BPM must be greater than 0");
-        }
-    }
     if args.subdivision <= 0.0 || args.subdivision > 4.0 {
         anyhow::bail!("subdivision must be between 0.0 and 4.0");
     }
     if args.search_step <= 0.0 {
         anyhow::bail!("--search-step must be greater than 0");
     }
-    if args.search_max < args.search_min {
-        anyhow::bail!("--search-max must be >= --search-min");
+    if let Some(max) = args.search_max {
+        if max < args.search_min {
+            anyhow::bail!("--search-max must be >= --search-min");
+        }
     }
+
+    // --- Parse BPM mode ---
+    let bpm_mode = BpmMode::parse(&args.bpm, args.bpm_min, args.bpm_max, args.bpm_step)
+        .context("Invalid --bpm value")?;
+
+    // Determine the BPM hint to pass to load_midi_sources for MIDI tick resolution.
+    // For auto-grid we pass None and rely on the MIDI file's embedded tempo.
+    let midi_bpm_hint: Option<f64> = match &bpm_mode {
+        BpmMode::Fixed(bpm) => Some(*bpm),
+        BpmMode::AutoGrid { .. } => None,
+    };
 
     // --- Load MIDI sources ---
     let (midi_paths, pinned_offsets) = parse_midi_specs(&args.midi_file)?;
@@ -797,9 +831,18 @@ fn run_find_arrangement(args: FindArrangementArgs) -> Result<()> {
             None    => println!("  {} (offset will be searched)", p.display()),
         }
     }
-    let (sources, effective_bpm) = load_midi_sources(&midi_path_refs, args.bpm)
+    let (sources, midi_effective_bpm) = load_midi_sources(&midi_path_refs, midi_bpm_hint)
         .context("Failed to load MIDI files")?;
-    println!("  Effective BPM: {:.1}", effective_bpm);
+    println!("  MIDI file BPM (for tick resolution): {:.1}", midi_effective_bpm);
+
+    match &bpm_mode {
+        BpmMode::Fixed(bpm) => println!("  BPM mode: fixed {:.2}", bpm),
+        BpmMode::AutoGrid { min, max, step } => println!(
+            "  BPM mode: auto-grid [{:.1}..{:.1} step {:.1}]  ({} candidates)",
+            min, max, step,
+            ((max - min) / step).floor() as usize + 1
+        ),
+    }
 
     // --- Load and analyse audio ---
     println!("Loading audio: {}", args.audio.display());
@@ -817,62 +860,104 @@ fn run_find_arrangement(args: FindArrangementArgs) -> Result<()> {
     analysis.observed_onsets = onsets;
     println!("  Detected {} onset peaks (threshold: {})", analysis.observed_onsets.len(), args.threshold);
 
-    // --- Build initial TimeMap ---
-    let time_sig = TimeSignature::new(args.time_sig_num, args.time_sig_den);
-    let mut time_map = build_time_map(effective_bpm, time_sig, Seconds(0.0));
-    time_map = apply_beat_zero_mode(time_map, &analysis.observed_onsets, args.refine_beat_zero, args.trim_audio, args.threshold);
-    println!("  Beat-zero: {:.4}s", time_map.beat_zero_seconds.0);
-
-    // --- Build per-source candidate offset lists ---
-    // Pinned sources (=N on the command line) get a single candidate [N].
-    // Free sources (no =) get the full search range [search_min..search_max step search_step].
-    let free_candidates: Vec<f64> = {
-        let mut v = Vec::new();
-        let mut o = args.search_min;
-        while o <= args.search_max + 1e-9 {
-            v.push(o);
-            o += args.search_step;
-        }
-        v
+    // --- Build OffsetSearchConfig for free sources ---
+    // Pinned sources (=N on the command line) get a single candidate [N] inside resolve_bpm.
+    // Free sources get the range [search_min..search_max step search_step] per BPM candidate.
+    // When search_max is None the upper bound is derived from the audio duration at each BPM:
+    //   max_beat = floor(audio_duration_seconds * bpm / 60.0)
+    let offset_config = OffsetSearchConfig {
+        min_beats: args.search_min,
+        max_beats: args.search_max,
+        step_beats: args.search_step,
+        audio_duration_seconds: duration.0,
     };
 
-    let per_source_candidates: Vec<Vec<f64>> = pinned_offsets
-        .iter()
-        .map(|pin| match pin {
-            Some(n) => vec![*n],
-            None    => free_candidates.clone(),
-        })
-        .collect();
-
-    // Warn about large searches.
-    let total_candidates: usize = per_source_candidates.iter().map(|c| c.len()).product::<usize>().max(1);
+    // For the diagnostics print, compute an illustrative free-candidate count.
+    // For auto-grid: use the midpoint BPM; for fixed: use the exact BPM.
+    let diag_bpm = match &bpm_mode {
+        BpmMode::Fixed(b) => *b,
+        BpmMode::AutoGrid { min, max, .. } => (min + max) / 2.0,
+    };
+    let diag_free_candidates = offset_config.free_candidates(diag_bpm);
     let n_free = pinned_offsets.iter().filter(|p| p.is_none()).count();
     let n_pinned = pinned_offsets.iter().filter(|p| p.is_some()).count();
+    let n_bpm_candidates: usize = match &bpm_mode {
+        BpmMode::Fixed(_) => 1,
+        BpmMode::AutoGrid { min, max, step } => ((max - min) / step).floor() as usize + 1,
+    };
+    let diag_total_offset: usize = {
+        let free_len = diag_free_candidates.len();
+        let pinned_count = n_pinned;
+        (free_len.pow(n_free as u32)).max(1) * if pinned_count > 0 { 1 } else { 1 }
+    };
+    let max_label = match args.search_max {
+        Some(m) => format!("{:.1}", m),
+        None    => format!("auto({:.1}@{:.0}bpm)", diag_free_candidates.last().copied().unwrap_or(0.0), diag_bpm),
+    };
     println!();
     println!(
-        "  Search: {} free source(s) × {} offsets [{:.1}..{:.1} step {:.1} beats]  +  {} pinned  =  {} candidates",
-        n_free, free_candidates.len(), args.search_min, args.search_max, args.search_step,
-        n_pinned, total_candidates
+        "  Offset search: {} free source(s) × ~{} offsets [{:.1}..{} step {:.1} beats]  +  {} pinned",
+        n_free, diag_free_candidates.len(), args.search_min, max_label, args.search_step, n_pinned,
     );
-    if total_candidates > 100_000 {
+    println!(
+        "  BPM candidates: {}   Est. evaluations per BPM: ~{}",
+        n_bpm_candidates, diag_total_offset,
+    );
+    if n_bpm_candidates as u64 * diag_total_offset as u64 > 100_000 {
         println!(
-            "  WARNING: {} candidates may be slow. Increase --search-step or narrow range.",
-            total_candidates
+            "  WARNING: ~{} total evaluations may be slow. Increase --search-step / --bpm-step or narrow ranges.",
+            n_bpm_candidates as u64 * diag_total_offset as u64
         );
     }
 
-    // --- Run search ---
-    let result = find_best_arrangement(
+    // --- Run BPM resolution + arrangement search ---
+    let time_sig = TimeSignature::new(args.time_sig_num, args.time_sig_den);
+
+    // For trim_audio: synthesise a single-element onset slice pointing at the
+    // first strong onset so that refine_beat_zero (called inside resolve_bpm per
+    // BPM candidate) snaps beat-zero to that onset unconditionally.
+    // For auto-grid + trim_audio: each BPM candidate will refine against this
+    // single strong onset, which is the correct behaviour.
+    let onsets_for_search: &[_] = &analysis.observed_onsets;
+    let trimmed_onsets: Vec<crate::domain::audio::ObservedOnset>;
+    let effective_onsets: &[crate::domain::audio::ObservedOnset] = if args.trim_audio {
+        if let Some(first) = onsets_for_search.iter().find(|o| o.strength >= args.threshold) {
+            trimmed_onsets = vec![crate::domain::audio::ObservedOnset {
+                time_seconds: first.time_seconds,
+                strength: 1.0,  // make it unconditionally strong
+                width_seconds: None,
+                confidence: None,
+            }];
+            &trimmed_onsets
+        } else {
+            onsets_for_search
+        }
+    } else {
+        onsets_for_search
+    };
+
+    let bpm_result = resolve_bpm(
+        &bpm_mode,
+        effective_onsets,
         &sources,
         &analysis.onset_curve,
-        &time_map,
-        &per_source_candidates,
+        time_sig,
+        &pinned_offsets,
+        &offset_config,
         args.event_window,
+        args.threshold,
     );
 
+    // Reconstruct final time_map from the winner.
+    let time_map = build_time_map(bpm_result.bpm, time_sig, bpm_result.beat_zero_seconds);
+
     println!();
-    println!("  Best arrangement found (overlap score: {:.4}):", result.score);
-    for (p, offset) in midi_paths.iter().zip(result.best_offsets.iter()) {
+    println!(
+        "  Best arrangement found (overlap score: {:.4}):",
+        bpm_result.score
+    );
+    println!("    BPM: {:.4}   Beat-zero: {:.4}s", bpm_result.bpm, bpm_result.beat_zero_seconds.0);
+    for (p, offset) in midi_paths.iter().zip(bpm_result.best_offsets.iter()) {
         println!("    {}  offset: {:.2} beats", p.display(), offset);
     }
 
@@ -885,7 +970,7 @@ fn run_find_arrangement(args: FindArrangementArgs) -> Result<()> {
     if args.show_expected_curve {
         let expected = render_expected_curve(
             &sources,
-            &result.best_offsets,
+            &bpm_result.best_offsets,
             &analysis.onset_curve,
             &time_map,
             args.event_window,
@@ -905,7 +990,7 @@ fn run_find_arrangement(args: FindArrangementArgs) -> Result<()> {
     };
 
     println!();
-    render_compare(&grid_onsets, duration.0, &sources, &result.best_offsets, &time_map, &render_config);
+    render_compare(&grid_onsets, duration.0, &sources, &bpm_result.best_offsets, &time_map, &render_config);
 
     Ok(())
 }

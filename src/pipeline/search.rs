@@ -173,6 +173,16 @@ pub fn score_arrangement(
             // Add Gaussian bump centred on this frame.
             // 3σ covers 99.7% of the bump; beyond that the contribution is negligible.
             let radius = (3.0 * sigma_frames).ceil() as i64;
+
+            // Skip events whose Gaussian footprint is entirely outside the frame buffer.
+            // This handles negative center_frame (MIDI note before beat_zero) and
+            // center_frame >= n_frames (MIDI note after audio ends).
+            // Without this guard, casting a negative i64 to usize wraps around and
+            // causes an out-of-bounds panic.
+            if center_frame + radius < 0 || center_frame - radius >= n_frames as i64 {
+                continue;
+            }
+
             let lo = (center_frame - radius).max(0) as usize;
             let hi = (center_frame + radius).min(n_frames as i64 - 1) as usize;
 
@@ -234,6 +244,12 @@ pub fn render_expected_curve(
             let center_frame = (event_seconds / hop).round() as i64;
 
             let radius = (3.0 * sigma_frames).ceil() as i64;
+
+            // Skip events whose Gaussian footprint is entirely outside the frame buffer.
+            if center_frame + radius < 0 || center_frame - radius >= n_frames as i64 {
+                continue;
+            }
+
             let lo = (center_frame - radius).max(0) as usize;
             let hi = (center_frame + radius).min(n_frames as i64 - 1) as usize;
 
