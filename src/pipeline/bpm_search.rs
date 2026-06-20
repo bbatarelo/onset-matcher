@@ -143,6 +143,9 @@ pub trait BpmEstimator {
     /// * `offset_config` — controls how free-source candidate lists are built per BPM.
     /// * `event_window_seconds` — Gaussian bump width for the expected-onset template.
     /// * `refine_threshold` — strength threshold passed to `refine_beat_zero`.
+    /// * `trim_beat_zero` — when `Some(t)`, pin `beat_zero_seconds = t` for every BPM
+    ///   candidate instead of calling `refine_beat_zero`.  This implements `--trim-audio`:
+    ///   the first strong onset is placed exactly at beat 0, regardless of BPM.
     fn estimate(
         &self,
         onsets: &[ObservedOnset],
@@ -153,6 +156,7 @@ pub trait BpmEstimator {
         offset_config: &OffsetSearchConfig,
         event_window_seconds: f64,
         refine_threshold: f32,
+        trim_beat_zero: Option<Seconds>,
     ) -> BpmSearchResult;
 }
 
@@ -163,8 +167,8 @@ pub trait BpmEstimator {
 /// Exhaustive BPM grid search.
 ///
 /// For every BPM in `[min, min+step, min+2·step, …, max]`:
-/// 1. Build a [`TimeMap`] with `beat_zero_seconds = 0`.
-/// 2. Refine `beat_zero` via `refine_beat_zero`.
+/// 1. Build a [`TimeMap`] with `beat_zero_seconds = 0` (or pinned via `trim_beat_zero`).
+/// 2. If no trim: refine `beat_zero` via `refine_beat_zero`.
 /// 3. Run `find_best_arrangement` to find the best offsets.
 /// 4. Keep the combination with the highest score.
 pub struct AutoGridEstimator {
@@ -184,16 +188,21 @@ impl BpmEstimator for AutoGridEstimator {
         offset_config: &OffsetSearchConfig,
         event_window_seconds: f64,
         refine_threshold: f32,
+        trim_beat_zero: Option<Seconds>,
     ) -> BpmSearchResult {
         let mut best: Option<BpmSearchResult> = None;
 
         let mut bpm = self.min;
         while bpm <= self.max + 1e-9 {
-            let time_map = build_time_map(bpm, time_signature, Seconds(0.0));
-            let time_map = if !onsets.is_empty() {
-                refine_beat_zero(onsets, &time_map, refine_threshold)
+            let time_map = if let Some(t) = trim_beat_zero {
+                // --trim-audio: place beat 0 exactly at the first strong onset,
+                // independently of BPM.  No refine_beat_zero needed.
+                build_time_map(bpm, time_signature, t)
+            } else if !onsets.is_empty() {
+                let base = build_time_map(bpm, time_signature, Seconds(0.0));
+                refine_beat_zero(onsets, &base, refine_threshold)
             } else {
-                time_map
+                build_time_map(bpm, time_signature, Seconds(0.0))
             };
 
             // Build per-source candidates for this BPM (free sources get auto-ranged).
@@ -247,6 +256,10 @@ impl BpmEstimator for AutoGridEstimator {
 ///
 /// For [`BpmMode::Fixed`] we still call `refine_beat_zero` and
 /// `find_best_arrangement` once — this keeps the calling code uniform.
+///
+/// `trim_beat_zero`: when `Some(t)`, `beat_zero_seconds` is set to `t` for every
+/// BPM candidate, bypassing `refine_beat_zero`.  Pass `Some(first_onset.time_seconds)`
+/// when `--trim-audio` is active to place beat 0 exactly at the first strong onset.
 pub fn resolve_bpm(
     mode: &BpmMode,
     onsets: &[ObservedOnset],
@@ -257,15 +270,18 @@ pub fn resolve_bpm(
     offset_config: &OffsetSearchConfig,
     event_window_seconds: f64,
     refine_threshold: f32,
+    trim_beat_zero: Option<Seconds>,
 ) -> BpmSearchResult {
     match mode {
         BpmMode::Fixed(bpm) => {
-            // Single BPM: build + refine + search once.
-            let time_map = build_time_map(*bpm, time_signature, Seconds(0.0));
-            let time_map = if !onsets.is_empty() {
-                refine_beat_zero(onsets, &time_map, refine_threshold)
+            // Single BPM: build + (optionally trim or refine) + search once.
+            let time_map = if let Some(t) = trim_beat_zero {
+                build_time_map(*bpm, time_signature, t)
+            } else if !onsets.is_empty() {
+                let base = build_time_map(*bpm, time_signature, Seconds(0.0));
+                refine_beat_zero(onsets, &base, refine_threshold)
             } else {
-                time_map
+                build_time_map(*bpm, time_signature, Seconds(0.0))
             };
             // Build per-source candidates for this fixed BPM.
             let free_candidates = offset_config.free_candidates(*bpm);
@@ -301,6 +317,7 @@ pub fn resolve_bpm(
                 offset_config,
                 event_window_seconds,
                 refine_threshold,
+                trim_beat_zero,
             )
         }
     }

@@ -434,11 +434,24 @@ Each cell represents a 1/8th-note subdivision (configurable). `•` marks a dete
 
 ---
 
-## Feature 5 — Diagnostics and Canonical Export
+## Feature 5 — Diagnostics and Canonical Export ✅
 
 **Goal**: Compute quality metrics, build the canonical JSON and flattened test fixture, wire the full pipeline.
 
 **New domain types**: `AlignmentResult`, `ArrangementMatch`, `MatchedOnsetCluster`, `AlignmentDiagnostics`, `AlignmentWarning`, `CanonicalPlaybackReference` and sub-types, `TestFixture`, `TestFixtureEvent`
+
+**New pipeline modules**: `pipeline/diagnostics.rs` (cluster-match logic, extracted from `run_score_arrangement`), `pipeline/canonical_builder.rs`
+
+**CLI surface**: `--export-dir <DIR>` and `--name <NAME>` added to `find-arrangement`.
+- Files are written only when `--export-dir` is present.
+- What is displayed on the grid is exactly what is encoded in the JSON (pinned offsets or searched offsets pass through unchanged).
+
+**`matchScore` in provenance**: cluster coverage ratio (`matched_clusters / total_clusters`, bounded [0, 1]).
+Not the raw dot-product overlap score; that is available as `overlap_score` on `ArrangementMatch` for internal use.
+
+**`scenario.rs` / `scenario_loader.rs`**: deferred — Feature 5 is output-only.
+
+**`beatTolerance` in `TestFixture`**: omitted entirely for now; add only when the feature is designed.
 
 **Outputs**: `canonical.json` (full rich format) + `test-fixture.json` (flattened, instrument-agnostic)
 

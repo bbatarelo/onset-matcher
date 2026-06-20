@@ -2,6 +2,8 @@ mod domain;
 mod pipeline;
 mod render;
 
+use std::fs;
+use std::io::BufWriter;
 use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -10,6 +12,8 @@ use domain::audio::ObservedOnset;
 use domain::time::{Seconds, TimeMap, TimeSignature};
 use pipeline::audio_analysis::analyze_audio;
 use pipeline::beat_mapper::{build_time_map, map_onsets_to_grid, refine_beat_zero};
+use pipeline::canonical_builder::{build_canonical, build_test_fixture};
+use pipeline::diagnostics::compute_diagnostics;
 use pipeline::midi_loader::load_midi_sources;
 use pipeline::onset_detection::{PeakPickerConfig, detect_onsets};
 use pipeline::bpm_search::{BpmMode, OffsetSearchConfig, resolve_bpm};
@@ -407,6 +411,16 @@ struct FindArrangementArgs {
     /// building the expected-onset template. Default: 0.025 (25 ms).
     #[arg(long, value_name = "SECONDS", default_value = "0.025")]
     event_window: f64,
+
+    /// If set, write canonical.json and test-fixture.json to this directory.
+    /// The directory is created if it does not exist.
+    #[arg(long, value_name = "DIR")]
+    export_dir: Option<PathBuf>,
+
+    /// Name for the canonical output (used as the "name" field in both output
+    /// files).  Defaults to the audio filename stem.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -684,108 +698,51 @@ fn run_score_arrangement(args: ScoreArrangementArgs) -> Result<()> {
     };
     render_compare(&grid_onsets, duration.0, &sources, &offsets, &time_map, &render_config);
 
-    // --- Build expected onset clusters from arrangement ---
-    // Collect all MIDI note-on events with their global beat (source beat + layer offset).
-    // Group events that land in the same subdivision cell into clusters.
-    let beats_per_bar = time_map.time_signature.beats_per_bar();
-    let subdivisions_per_bar = (beats_per_bar / args.subdivision).round() as usize;
-
-    // Map: grid cell (bar, sub_idx) -> Vec<(note, source_idx)>
-    let mut cell_events: std::collections::BTreeMap<(usize, usize), Vec<u8>> =
-        std::collections::BTreeMap::new();
-    for (src_idx, source) in sources.iter().enumerate() {
-        let offset = offsets.get(src_idx).copied().unwrap_or(0.0);
-        for event in &source.events {
-            let global_beat = event.beat.0 + offset;
-            if global_beat < 0.0 { continue; }
-            let bar = (global_beat / beats_per_bar).floor() as usize;
-            let beat_in_bar = global_beat % beats_per_bar;
-            let sub_idx = (beat_in_bar / args.subdivision).round() as usize;
-            let sub_idx = sub_idx.min(subdivisions_per_bar - 1);
-            cell_events.entry((bar, sub_idx)).or_default().push(event.note);
-        }
-    }
-
-    // Each occupied cell is one expected onset cluster.
-    // Representative beat = bar * beats_per_bar + sub_idx * subdivision.
-    struct Cluster {
-        beat: f64,
-        notes: Vec<u8>,
-        matched: bool,
-        error_beats: f64,
-    }
-
-    let mut clusters: Vec<Cluster> = cell_events
-        .into_iter()
-        .map(|((bar, sub_idx), mut notes)| {
-            notes.sort_unstable();
-            notes.dedup();
-            let beat = bar as f64 * beats_per_bar + sub_idx as f64 * args.subdivision;
-            Cluster { beat, notes, matched: false, error_beats: 0.0 }
-        })
-        .collect();
-
-    // Match each cluster to the nearest observed onset within tolerance.
-    // Observed onsets are in beat space via grid_onsets.
-    let tolerance = args.match_tolerance;
-    for cluster in &mut clusters {
-        // Find the observed onset closest to cluster.beat.
-        let best = grid_onsets.iter().min_by(|a, b| {
-            let da = (a.beat.0 - cluster.beat).abs();
-            let db = (b.beat.0 - cluster.beat).abs();
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        if let Some(onset) = best {
-            let err = onset.beat.0 - cluster.beat;
-            if err.abs() <= tolerance {
-                cluster.matched = true;
-                cluster.error_beats = err;
-            }
-        }
-    }
+    // --- Diagnostics ---
+    let diagnostics = compute_diagnostics(
+        &sources,
+        &offsets,
+        &grid_onsets,
+        &time_map,
+        args.subdivision,
+        args.match_tolerance,
+    );
 
     // --- Print scoring results ---
-    let matched = clusters.iter().filter(|c| c.matched).count();
-    let total = clusters.len();
-    let score = if total > 0 { matched as f64 / total as f64 } else { 0.0 };
-
     println!();
     println!(
         "  Score: {:.3} ({:.1}%)  |  {}/{} clusters matched  |  tolerance: ±{} beats",
-        score, score * 100.0, matched, total, tolerance
+        diagnostics.coverage,
+        diagnostics.coverage * 100.0,
+        diagnostics.matched_clusters,
+        diagnostics.total_clusters,
+        args.match_tolerance,
     );
     println!();
     println!("  Cluster analysis:");
 
-    for cluster in &clusters {
-        if cluster.matched {
+    for mc in &diagnostics.matched_onset_clusters {
+        if mc.is_matched() {
             println!(
-                "    Beat {:>7.3}  ■ matched   error: {:+.4} beats   notes: {:?}",
-                cluster.beat, cluster.error_beats, cluster.notes
+                "    Beat {:>7.3}  ■ matched   error: {:+.4} beats",
+                mc.cluster.beat.0, mc.timing_error_beats,
             );
         } else {
             println!(
-                "    Beat {:>7.3}  ✗ unmatched                          notes: {:?}",
-                cluster.beat, cluster.notes
+                "    Beat {:>7.3}  ✗ unmatched",
+                mc.cluster.beat.0,
             );
         }
     }
 
-    // Unmatched observed onsets.
-    let mut unmatched_onsets: Vec<f64> = grid_onsets
-        .iter()
-        .filter(|onset| {
-            !clusters.iter().any(|c| c.matched && (c.beat - onset.beat.0).abs() <= tolerance)
-        })
-        .map(|o| o.beat.0)
-        .collect();
-    unmatched_onsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    if !unmatched_onsets.is_empty() {
+    if !diagnostics.unmatched_observed_beats.is_empty() {
         println!();
-        println!("  Unmatched audio onsets ({}):", unmatched_onsets.len());
-        for beat in &unmatched_onsets {
-            println!("    Beat {:>7.3}  (no expected cluster within ±{} beats)", beat, tolerance);
+        println!("  Unmatched audio onsets ({}):", diagnostics.unmatched_observed_beats.len());
+        for beat in &diagnostics.unmatched_observed_beats {
+            println!(
+                "    Beat {:>7.3}  (no expected cluster within ±{} beats)",
+                beat.0, args.match_tolerance,
+            );
         }
     }
     println!();
@@ -913,32 +870,22 @@ fn run_find_arrangement(args: FindArrangementArgs) -> Result<()> {
     // --- Run BPM resolution + arrangement search ---
     let time_sig = TimeSignature::new(args.time_sig_num, args.time_sig_den);
 
-    // For trim_audio: synthesise a single-element onset slice pointing at the
-    // first strong onset so that refine_beat_zero (called inside resolve_bpm per
-    // BPM candidate) snaps beat-zero to that onset unconditionally.
-    // For auto-grid + trim_audio: each BPM candidate will refine against this
-    // single strong onset, which is the correct behaviour.
-    let onsets_for_search: &[_] = &analysis.observed_onsets;
-    let trimmed_onsets: Vec<crate::domain::audio::ObservedOnset>;
-    let effective_onsets: &[crate::domain::audio::ObservedOnset] = if args.trim_audio {
-        if let Some(first) = onsets_for_search.iter().find(|o| o.strength >= args.threshold) {
-            trimmed_onsets = vec![crate::domain::audio::ObservedOnset {
-                time_seconds: first.time_seconds,
-                strength: 1.0,  // make it unconditionally strong
-                width_seconds: None,
-                confidence: None,
-            }];
-            &trimmed_onsets
-        } else {
-            onsets_for_search
-        }
+    // For --trim-audio: compute the exact beat_zero to pass into resolve_bpm so
+    // that beat 0 is placed exactly at the first strong onset, for every BPM
+    // candidate.  This is the correct implementation of "trim audio = first onset
+    // is beat 0"; refine_beat_zero is intentionally bypassed in this mode.
+    let trim_beat_zero: Option<Seconds> = if args.trim_audio {
+        analysis.observed_onsets
+            .iter()
+            .find(|o| o.strength >= args.threshold)
+            .map(|o| o.time_seconds)
     } else {
-        onsets_for_search
+        None
     };
 
     let bpm_result = resolve_bpm(
         &bpm_mode,
-        effective_onsets,
+        &analysis.observed_onsets,
         &sources,
         &analysis.onset_curve,
         time_sig,
@@ -946,6 +893,7 @@ fn run_find_arrangement(args: FindArrangementArgs) -> Result<()> {
         &offset_config,
         args.event_window,
         args.threshold,
+        trim_beat_zero,
     );
 
     // Reconstruct final time_map from the winner.
@@ -991,6 +939,70 @@ fn run_find_arrangement(args: FindArrangementArgs) -> Result<()> {
 
     println!();
     render_compare(&grid_onsets, duration.0, &sources, &bpm_result.best_offsets, &time_map, &render_config);
+
+    // --- Optional canonical export ---
+    if let Some(export_dir) = args.export_dir {
+        // Derive the fixture name: user-supplied or audio filename stem.
+        let fixture_name = args.name.clone().unwrap_or_else(|| {
+            args.audio
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "fixture".to_string())
+        });
+
+        // Compute diagnostics (using a default 0.5-beat match tolerance).
+        let default_match_tolerance = 0.5;
+        let diagnostics = compute_diagnostics(
+            &sources,
+            &bpm_result.best_offsets,
+            &grid_onsets,
+            &time_map,
+            args.subdivision,
+            default_match_tolerance,
+        );
+
+        // Build canonical and test-fixture outputs.
+        let canonical = build_canonical(
+            &fixture_name,
+            &sources,
+            &bpm_result.best_offsets,
+            &time_map,
+            &diagnostics,
+            &args.audio,
+            bpm_result.score,
+        );
+        let fixture = build_test_fixture(&canonical);
+
+        // Write files.
+        fs::create_dir_all(&export_dir)
+            .with_context(|| format!("Failed to create export directory: {}", export_dir.display()))?;
+
+        let canonical_path = export_dir.join("canonical.json");
+        {
+            let file = fs::File::create(&canonical_path)
+                .with_context(|| format!("Failed to create {}", canonical_path.display()))?;
+            serde_json::to_writer_pretty(BufWriter::new(file), &canonical)
+                .with_context(|| format!("Failed to write {}", canonical_path.display()))?;
+        }
+
+        let fixture_path = export_dir.join("test-fixture.json");
+        {
+            let file = fs::File::create(&fixture_path)
+                .with_context(|| format!("Failed to create {}", fixture_path.display()))?;
+            serde_json::to_writer_pretty(BufWriter::new(file), &fixture)
+                .with_context(|| format!("Failed to write {}", fixture_path.display()))?;
+        }
+
+        println!();
+        println!(
+            "  Exported canonical.json ({} events, {:.1}% coverage) and test-fixture.json ({} beat clusters)",
+            canonical.events.len(),
+            diagnostics.coverage * 100.0,
+            fixture.events.len(),
+        );
+        println!("    canonical.json   → {}", canonical_path.display());
+        println!("    test-fixture.json → {}", fixture_path.display());
+    }
 
     Ok(())
 }

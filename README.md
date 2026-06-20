@@ -185,8 +185,8 @@ A music application under test can:
 5. Compare against the golden canonical JSON
 
 The test succeeds if the events match at the correct beat positions (within a configurable tolerance). The instrument sound, audio quality, and clock jitter are all irrelevant to the comparison.
-
 ---
+
 
 ## Domain Vocabulary
 
@@ -210,6 +210,10 @@ The test succeeds if the events match at the correct beat positions (within a co
 ## Architecture
 
 See [`plans/architecture.md`](plans/architecture.md) for the detailed technical architecture: module structure, all Rust type definitions, dependency choices, implementation phases, and the scoring algorithm.
+
+See [`docs/client-integration.md`](docs/client-integration.md) for the client integration guide: how to use `test-fixture.json` in application tests on iOS, Android, or any other platform.
+
+See [`plans/beat-fixture-kit.md`](plans/beat-fixture-kit.md) for the design plan for `BeatFixtureKit`, the companion Swift Package for loading and comparing `test-fixture.json` in iOS/macOS XCTest unit tests.
 
 ---
 
@@ -416,6 +420,18 @@ onset-matcher find-arrangement --audio reference.wav \
 # Trim audio beat-zero before searching
 onset-matcher find-arrangement --audio reference.wav \
   -m pattern.mid --search-max 8 --trim-audio
+
+# ── Export canonical.json and test-fixture.json ───────────────────────────
+
+# Manually pin all MIDI offsets and export — what you see on screen is what you get in the files
+onset-matcher find-arrangement --audio reference.wav --bpm=120 \
+  -m intro.mid=0 -m verse.mid=16 \
+  --export-dir ./output --name my_drum_pattern
+
+# Auto-search then export
+onset-matcher find-arrangement --audio reference.wav \
+  -m pattern.mid --search-max 16 \
+  --export-dir ./output --name kick_loop
 ```
 
 #### Performance note
@@ -476,6 +492,8 @@ When `auto-grid` is used, also set:
 | `--search-max <BEATS>` | `0.0` | Maximum beat offset to try for free sources (set above `--search-min` to enable range) |
 | `--search-step <BEATS>` | `1.0` | Step between candidate offsets |
 | `--event-window <SEC>` | `0.025` | Gaussian template width in seconds (larger = more tolerant of jitter) |
+| `--export-dir <DIR>` | — | Write `canonical.json` and `test-fixture.json` to this directory |
+| `--name <NAME>` | audio filename stem | Name field in the exported JSON files |
 
 ### `--midi-file` / `-m` flag
 
@@ -491,7 +509,7 @@ The flag is repeatable. The same file may appear multiple times at different off
 
 ## Project Status
 
-Features 1–4b are complete and the project is runnable. Domain types grow incrementally alongside features.
+Features 1–5 are complete and the project is runnable. Domain types grow incrementally alongside features.
 
 The planned feature milestones are:
 
@@ -510,8 +528,13 @@ Automatically search for the beat offsets for each MIDI file that maximise overl
 **Feature 4b — Auto-BPM calibration** ✅
 `--bpm=auto-grid` discovers the true recording tempo automatically by trying every BPM in a configurable range and picking the one that produces the highest cross-correlation score with the MIDI onset template. This corrects for clock-rate mismatch between drum machines and DAW exports — e.g. a pattern exported at 100 BPM that was recorded slightly fast at 99.5 BPM effective. `--bpm-min`, `--bpm-max`, `--bpm-step` control the search range (defaults: 60–200 at 1 BPM steps). Combined with per-source offset search: total evaluations = BPM candidates × offset combinations.
 
-**Feature 5 — Canonical export** _(next)_
+**Feature 5 — Canonical export** ✅
 Compute diagnostics and produce both output files (`canonical.json` and `test-fixture.json`).
+Added `--export-dir <DIR>` and `--name <NAME>` flags to `find-arrangement`.  When `--export-dir` is set, two files are written:
+- `canonical.json` — full rich format (sources, layers, events, onset clusters, provenance)
+- `test-fixture.json` — flattened minimal format (`beat` + `notes` only) for use in application tests
+
+Cluster-matching diagnostics are computed post-search and the `matchScore` in `provenance` is the cluster coverage ratio (`matched_clusters / total_clusters`, bounded [0, 1]).
 
 ---
 
